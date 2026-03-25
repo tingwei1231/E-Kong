@@ -203,6 +203,13 @@ def start_server(port: int) -> subprocess.Popen:
     subprocess.Popen
         uvicorn 子程序 handle（可用於後續監控或終止）。
     """
+    # 確保強制砍掉先前的 uvicorn process，避免 port 衝突 ([Errno 98] Address already in use)
+    try:
+        os.system("pkill -f uvicorn")
+        time.sleep(1)
+    except Exception as e:
+        logger.debug(f"清理舊 uvicorn 時略過：{e}")
+
     cmd = [
         sys.executable, "-m", "uvicorn",
         "app.main:app",
