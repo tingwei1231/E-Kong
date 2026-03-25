@@ -127,7 +127,14 @@ def start_ngrok(port: int) -> str:
             ngrok.disconnect(t.public_url)
         ngrok.kill()
     except Exception as e:
-        logger.debug(f"清理舊 ngrok 時略過：{e}")
+        logger.debug(f"清理舊 ngrok Pyngrok 狀態時略過：{e}")
+        
+    # 強制透過 OS 層級砍掉背景所有殘留的 ngrok 執行緒 (適用於 Colab 環境重啟 kernel)
+    try:
+        os.system("pkill -f ngrok")
+        time.sleep(1)  # 稍微等待系統釋放 port 與連線
+    except Exception as e:
+        logger.debug(f"OS 砍掉 ngrok 時發生錯誤: {e}")
 
     tunnel = ngrok.connect(port, bind_tls=True)
     public_url: str = tunnel.public_url.rstrip("/")
