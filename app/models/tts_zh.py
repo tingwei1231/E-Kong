@@ -43,6 +43,12 @@ async def init_tts_zh() -> None:
             return
         logger.info("🔊 載入 ChatTTS 中文 TTS 模型...")
         try:
+            # 解決 PyTorch 2.4+ 移除了 torch.serialization.FILE_LIKE 的相容性問題
+            import typing
+            import torch
+            if not hasattr(torch.serialization, 'FILE_LIKE'):
+                torch.serialization.FILE_LIKE = typing.Any
+
             import ChatTTS  # type: ignore
             loop = asyncio.get_event_loop()
 
