@@ -1,0 +1,36 @@
+# ── Core Web Framework ──────────────────────────────────────────────────────
+fastapi==0.111.0
+uvicorn[standard]==0.29.0
+python-dotenv==1.0.1
+httpx==0.27.0
+
+# ── LINE Messaging API ───────────────────────────────────────────────────────
+line-bot-sdk==3.11.0
+
+# ── Tunnel / ngrok ───────────────────────────────────────────────────────────
+pyngrok==7.1.6
+
+# ── STT: faster-whisper (INT8 量化) ──────────────────────────────────────────
+faster-whisper==1.0.3
+
+# ── LLM: llama-cpp-python (GGUF 4-bit, CUDA offload) ────────────────────────
+# setup_colab.py 會以 --extra-index-url 覆蓋安裝 CUDA 預編譯版本
+# 本行僅作為 CPU fallback（本機開發 / CI 環境）
+llama-cpp-python==0.2.90
+
+# ── TTS: ChatTTS (中文) & MMS-TTS (台語) ────────────────────────────────────
+# ChatTTS pip 套件名稱（注意：不是 "ChatTTS==x.x.x"）
+chattts==0.1.1
+transformers==4.41.2
+# torch/torchaudio 在 Colab 環境已內建（CUDA 版），不在此處鎖版以避免衝突
+# 本機開發請手動: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
+soundfile==0.12.1
+
+# ── Observability & Utilities ────────────────────────────────────────────────
+loguru==0.7.2
+pydantic==2.7.1
+pydantic-settings==2.3.0
+
+# ── Dev / Test（本機開發用，Colab 可選裝）────────────────────────────────────
+pytest==8.2.2
+pytest-asyncio==0.23.7
