@@ -120,6 +120,15 @@ def start_ngrok(port: int) -> str:
         ngrok 提供的 HTTPS public URL（不帶尾斜線）。
     """
     ngrok_conf.get_default().auth_token = NGROK_AUTH_TOKEN
+
+    # 確保清除之前殘留的 ngrok 連線，避免 "already online" (ERR_NGROK_334) 錯誤
+    try:
+        for t in ngrok.get_tunnels():
+            ngrok.disconnect(t.public_url)
+        ngrok.kill()
+    except Exception as e:
+        logger.debug(f"清理舊 ngrok 時略過：{e}")
+
     tunnel = ngrok.connect(port, bind_tls=True)
     public_url: str = tunnel.public_url.rstrip("/")
     logger.success(f"🌐 ngrok tunnel 已啟動：{public_url}")
