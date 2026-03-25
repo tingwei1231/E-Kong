@@ -140,7 +140,7 @@ def update_line_webhook(public_url: str) -> None:
         "Authorization": f"Bearer {LINE_CHANNEL_ACCESS_TOKEN}",
         "Content-Type": "application/json",
     }
-    payload = {"webhook": webhook_url}
+    payload = {"endpoint": webhook_url}
 
     with httpx.Client(timeout=15) as client:
         resp = client.put(
