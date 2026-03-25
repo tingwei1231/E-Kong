@@ -136,7 +136,8 @@ def start_ngrok(port: int) -> str:
     except Exception as e:
         logger.debug(f"OS 砍掉 ngrok 時發生錯誤: {e}")
 
-    tunnel = ngrok.connect(port, bind_tls=True)
+    # 指定 127.0.0.1 避免 ngrok 預設解析到 IPv6 [::1] 導致 connection refused
+    tunnel = ngrok.connect(f"127.0.0.1:{port}", bind_tls=True)
     public_url: str = tunnel.public_url.rstrip("/")
     logger.success(f"🌐 ngrok tunnel 已啟動：{public_url}")
     return public_url
