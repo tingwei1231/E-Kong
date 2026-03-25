@@ -13,7 +13,7 @@ from __future__ import annotations
 from contextlib import asynccontextmanager
 from typing import AsyncIterator
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Header, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from loguru import logger
 
@@ -104,7 +104,7 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 # ─── 路由 ─────────────────────────────────────────────────────────────────────
 
 @app.post("/webhook", status_code=200, summary="LINE Webhook 接收端點")
-async def webhook(request: Request) -> PlainTextResponse:
+async def webhook(request: Request, x_line_signature: str = Header(...)) -> PlainTextResponse:
     """
     LINE Messaging API Webhook 端點。
 
@@ -112,7 +112,7 @@ async def webhook(request: Request) -> PlainTextResponse:
       1. 委派 `dispatch_events` 驗證簽名並路由事件
       2. 回傳 200 OK（LINE 需在 1 秒內收到回應）
     """
-    await dispatch_events(request)
+    await dispatch_events(request, x_line_signature)
     return PlainTextResponse("OK")
 
 

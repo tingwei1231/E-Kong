@@ -227,7 +227,7 @@ async def handle_follow_event(event: dict[str, Any]) -> None:
 
 # ─── 主進入點 ──────────────────────────────────────────────────────────────────
 
-async def dispatch_events(request: Request, x_line_signature: str = Header(...)) -> None:
+async def dispatch_events(request: Request, x_line_signature: str) -> None:
     """
     Webhook 主處理函式；由 FastAPI router 呼叫。
 
