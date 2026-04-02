@@ -143,8 +143,14 @@ async def generate(
     if finish_reason == "length":
         logger.warning("⚠️  LLM 達到 max_tokens 限制，回覆可能截斷。")
 
-    logger.debug(
-        f"🤖 LLM 生成｜tokens={output['usage']['completion_tokens']}｜"
-        f"finish={finish_reason}｜{text[:80]}{'…' if len(text) > 80 else ''}"
-    )
+    if not text:
+        logger.warning(
+            f"⚠️  LLM 輸出空字串｜finish={finish_reason}｜"
+            f"raw={output['choices'][0]['text']!r}"
+        )
+    else:
+        logger.debug(
+            f"🤖 LLM 生成｜tokens={output['usage']['completion_tokens']}｜"
+            f"finish={finish_reason}｜{repr(text[:80])}"
+        )
     return text

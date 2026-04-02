@@ -279,25 +279,46 @@ def build_prompt(
 
 # ─── JSON 解析 ────────────────────────────────────────────────────────────────
 
-_JSON_EXTRACT_RE = re.compile(r"\{.*\}", re.DOTALL)
+_JSON_EXTRACT_RE = re.compile(r"\{.*?\}", re.DOTALL)
+# 支援 LLM 把 JSON 包在 ```json ... ``` 的情況
+_MD_CODE_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
 
 def parse_llm_json(raw: str, fallback_emotion: Emotion) -> AgentResponse:
     """
     解析 LLM 輸出的 JSON 字串，容錯處理各種邊界情況。
 
-    若解析失敗（輸出不合格 JSON），以 raw 文字作為 companion 回覆的 fallback。
+    容錯順序：
+      1. 空字串 → 直接 fallback（避免 JSONDecodeError 噪音）
+      2. Markdown code block 包裝（```json {...} ```）→ 抽取
+      3. 裸 JSON 區塊（regex {…}）→ 抽取
+      4. 整段當 json_str → 嘗試解析
+      5. 全失敗 → fallback companion 回覆
     """
-    # 嘗試從輸出中抽取 JSON 區塊（LLM 可能多輸出文字）
-    m = _JSON_EXTRACT_RE.search(raw)
-    json_str = m.group(0) if m else raw
+    if not raw.strip():
+        logger.warning("⚠️  LLM 輸出空字串，直接使用 fallback 回覆。")
+        return AgentResponse(
+            intent=Intent.COMPANION,
+            user_emotion=fallback_emotion.value,
+            response_language="zh-TW",
+            response_text="哎，我剛才沒反應過來，能再說一次嗎？",
+            emotion=fallback_emotion,
+        )
+
+    # 嘗試從 markdown code block 抽取
+    md_m = _MD_CODE_BLOCK_RE.search(raw)
+    if md_m:
+        json_str = md_m.group(1)
+    else:
+        # 嘗試從輸出中抽取最外層 JSON 區塊
+        brace_m = _JSON_EXTRACT_RE.search(raw)
+        json_str = brace_m.group(0) if brace_m else raw
 
     try:
         data = json.loads(json_str)
         intent_val = data.get("intent", "companion")
         intent = Intent(intent_val) if intent_val in Intent._value2member_map_ else Intent.COMPANION
 
-        # 嘗試將 LLM 回傳的 emotion 字串對應到 Enum
         llm_emotion_str = data.get("user_emotion", fallback_emotion.value)
         try:
             resolved_emotion = Emotion(llm_emotion_str)
@@ -312,7 +333,9 @@ def parse_llm_json(raw: str, fallback_emotion: Emotion) -> AgentResponse:
             emotion=resolved_emotion,
         )
     except (json.JSONDecodeError, KeyError, ValueError) as exc:
-        logger.warning(f"⚠️  LLM JSON 解析失敗（{exc}），使用 fallback 回覆。")
+        logger.warning(
+            f"⚠️  LLM JSON 解析失敗（{exc}）｜raw={raw!r:.120}，使用 fallback 回覆。"
+        )
         return AgentResponse(
             intent=Intent.COMPANION,
             user_emotion=fallback_emotion.value,
