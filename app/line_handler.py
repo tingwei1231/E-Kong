@@ -137,10 +137,11 @@ async def handle_text_message(event: dict[str, Any]) -> None:
 
     # ── LLM Agent 推論 ───────────────────────────────────────────────────────────
     try:
-        reply, emotion = await chat(user_id, text)
-        logger.info(f"✅ LLM│{user_id}│{emotion.zh}{emotion.emoji}│{reply[:60]}")
-        # 先嘗試语音回覆，失敗則 fallback 純文字
-        voice_ok = await try_reply_audio(reply_token, reply, language=None)
+        reply, emotion, resp_lang = await chat(user_id, text)
+        logger.info(f"✅ LLM│{user_id}│{emotion.zh}{emotion.emoji}│lang={resp_lang}│{reply[:60]}")
+        # "nan" → 台語 TTS，其餘 → None（中文 TTS）
+        tts_lang = resp_lang if resp_lang == "nan" else None
+        voice_ok = await try_reply_audio(reply_token, reply, language=tts_lang)
         if not voice_ok:
             await reply_text(reply_token, reply)
     except RuntimeError:
@@ -182,8 +183,8 @@ async def handle_audio_message(event: dict[str, Any]) -> None:
 
         # 3. LLM        # STT 完成後進 LLM Agent
         try:
-            reply, emotion = await chat(user_id, result.text)
-            logger.info(f"✅ LLM│{user_id}│{emotion.zh}{emotion.emoji}│{reply[:60]}")
+            reply, emotion, resp_lang = await chat(user_id, result.text)
+            logger.info(f"✅ LLM│{user_id}│{emotion.zh}{emotion.emoji}│lang={resp_lang}│{reply[:60]}")
         except RuntimeError:
             # LLM 尚未初始化 → graceful fallback：回覆 STT 轉錄文字
             lang_label = {"zh": "🇨🇳 中文", "nan": "🇹🇼 台語"}.get(
@@ -192,9 +193,11 @@ async def handle_audio_message(event: dict[str, Any]) -> None:
             reply = (
                 f"🗣️ 我聽到你說（{lang_label}）：\n{result.text}"
             )
+            resp_lang = result.language  # STT 偵測語言當 fallback
 
-        # TTS 语音回覆（依偷測語言自動選擇引擎）
-        voice_ok = await try_reply_audio(reply_token, reply, language=result.language)
+        # TTS 語音回覆（"nan" → 台語 TTS；其餘 → None/中文）
+        tts_lang = resp_lang if resp_lang == "nan" else None
+        voice_ok = await try_reply_audio(reply_token, reply, language=tts_lang)
         if not voice_ok:
             await reply_text(reply_token, reply)
 

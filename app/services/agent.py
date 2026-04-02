@@ -4,12 +4,13 @@ app/services/agent.py — 情緒感知 LLM Agent 服務
 職責：
   1. 對話歷史管理（In-memory，per-user，環形緩衝）
   2. 情緒偵測（關鍵詞 + 標點啟發式規則，輕量快速）
-  3. 系統 Prompt 組裝（含角色設定 + 情緒上下文 + 對話歷史）
-  4. 呼叫 llm.generate() 取得回覆
+  3. 系統 Prompt 組裝（含角色設定 + JSON 輸出格式要求）
+  4. 呼叫 llm.generate() 取得 JSON 回覆，並解析路由
 
 設計原則：
   - 歷史記錄以 deque(maxlen=N) 實作環形緩衝，防記憶體無限增長
-  - 情緒偵測與 Prompt 組裝分離，便於後續替換為 BERT 情緒分類模型
+  - LLM 強制輸出 JSON {intent, user_emotion, response_language, response_text}
+  - intent="translate" → 直接翻譯；intent="companion" → 情緒陪伴回覆
   - TAIDE / Llama-3 均使用 ChatML 格式（<|im_start|> … <|im_end|>）
 
 Prompt 格式（ChatML）：
@@ -22,6 +23,7 @@ Prompt 格式（ChatML）：
 
 from __future__ import annotations
 
+import json
 import re
 from collections import deque
 from dataclasses import dataclass, field
@@ -37,42 +39,66 @@ from app.models.llm import generate
 
 class Emotion(str, Enum):
     """偵測到的情緒類別。"""
-    HAPPY    = "happy"
-    SAD      = "sad"
-    ANXIOUS  = "anxious"
-    ANGRY    = "angry"
-    LONELY   = "lonely"
-    NEUTRAL  = "neutral"
+    HAPPY     = "happy"
+    SAD       = "sad"
+    ANXIOUS   = "anxious"
+    ANGRY     = "angry"
+    LONELY    = "lonely"
+    EXHAUSTED = "exhausted"
+    NEUTRAL   = "neutral"
 
     @property
     def zh(self) -> str:
         """中文標籤（用於 Prompt 組裝）。"""
         return {
-            "happy":   "開心",
-            "sad":     "難過",
-            "anxious": "焦慮",
-            "angry":   "生氣",
-            "lonely":  "孤獨",
-            "neutral": "平靜",
+            "happy":     "開心",
+            "sad":       "難過",
+            "anxious":   "焦慮",
+            "angry":     "生氣",
+            "lonely":    "孤獨",
+            "exhausted": "疲憊",
+            "neutral":   "平靜",
         }[self.value]
 
     @property
     def emoji(self) -> str:
         return {
             "happy": "😊", "sad": "😢", "anxious": "😰",
-            "angry": "😤", "lonely": "🥺", "neutral": "😌",
+            "angry": "😤", "lonely": "🥺", "exhausted": "😩",
+            "neutral": "😌",
         }[self.value]
+
+
+# ─── Intent 枚舉 ──────────────────────────────────────────────────────────────
+
+class Intent(str, Enum):
+    """使用者意圖類別。"""
+    TRANSLATE = "translate"   # 明確要求翻譯
+    COMPANION = "companion"   # 閒聊 / 情緒陪伴
+
+
+# ─── Agent 回應結構 ────────────────────────────────────────────────────────────
+
+@dataclass
+class AgentResponse:
+    """解析後的 LLM JSON 輸出。"""
+    intent:            Intent
+    user_emotion:      str      # LLM 自行判斷的情緒字串（如 "sad", "exhausted"）
+    response_language: str      # "zh-TW" | "nan"
+    response_text:     str      # 實際回覆內容
+    emotion:           Emotion  # 本地 heuristic 偵測結果（保留供 TTS 參考）
 
 
 # ─── 情緒偵測（輕量 heuristic，Step 4 後可替換 BERT 分類器）───────────────────
 
 # 關鍵詞對應情緒類別（中文 + 台語羅馬拼音常見詞）
 _EMOTION_KEYWORDS: dict[Emotion, list[str]] = {
-    Emotion.HAPPY:   ["開心", "高興", "快樂", "棒", "太好了", "哈哈", "😄", "🎉", "爽", "讚"],
-    Emotion.SAD:     ["難過", "傷心", "哭", "可憐", "失落", "沮喪", "心痛", "痛苦", "😢", "😭"],
-    Emotion.ANXIOUS: ["擔心", "焦慮", "緊張", "不安", "怕", "害怕", "恐慌", "壓力", "😰", "😨"],
-    Emotion.ANGRY:   ["氣", "生氣", "憤怒", "煩", "討厭", "幹", "靠", "怒", "😤", "😠"],
-    Emotion.LONELY:  ["寂寞", "孤獨", "孤單", "沒人", "沒朋友", "想你", "思念", "🥺", "😔"],
+    Emotion.HAPPY:     ["開心", "高興", "快樂", "棒", "太好了", "哈哈", "😄", "🎉", "爽", "讚"],
+    Emotion.SAD:       ["難過", "傷心", "哭", "可憐", "失落", "沮喪", "心痛", "痛苦", "😢", "😭"],
+    Emotion.ANXIOUS:   ["擔心", "焦慮", "緊張", "不安", "怕", "害怕", "恐慌", "壓力", "😰", "😨"],
+    Emotion.ANGRY:     ["氣", "生氣", "憤怒", "煩", "討厭", "幹", "靠", "怒", "😤", "😠"],
+    Emotion.LONELY:    ["寂寞", "孤獨", "孤單", "沒人", "沒朋友", "想你", "思念", "🥺", "😔"],
+    Emotion.EXHAUSTED: ["累", "好累", "疲憊", "沒力", "撐不住", "精疲力竭", "😩", "🥱"],
 }
 
 # 問句 / 感嘆號多 → 焦慮傾向
@@ -167,18 +193,36 @@ def clear_history(user_id: str) -> None:
 # ─── System Prompt ────────────────────────────────────────────────────────────
 
 _BASE_SYSTEM_PROMPT = """\
-你是「Ē-Kóng（會講）」，一個溫柔、有耐心、善解人意的語音陪伴助手。
-你擅長中文與台語，能自然切換兩種語言回應使用者。
+你是「Ē-Kóng (會講)」，一個具備情緒感知與台/中雙語能力的智慧陪伴 Agent。
+你必須分析使用者的輸入（純文字），並以 JSON 格式輸出你的判斷與回應。
 
-回覆原則：
-- 語氣親切溫暖，像老朋友在聊天
-- 回覆簡短扼要（100 字以內），適合語音播放
-- 不說教、不評判，以同理心回應情緒
-- 若使用者說台語，盡量用台語或中台混用回覆
-- 絕對不說「我是 AI」或揭露自己的模型身份
+【意圖分類 (intent)】
+- translate：使用者明確要求翻譯（例如：「幫我用台語說...」、「這句台語怎麼講」）
+- companion：使用者在閒聊、訴苦、分享日常（例如：「今天老闆好煩」、「我好累」）
+
+【情緒感知 (user_emotion)】判斷使用者的情緒狀態，可能值：neutral, sad, angry, happy, exhausted, anxious, lonely
+
+【生成回應 (response_text)】
+- 若 intent 為 translate：直接且精準地給出翻譯結果，無需多餘廢話。
+- 若 intent 為 companion：展現極高的同理心與溫暖。如果是負面情緒，請先安撫與共情；
+  語氣必須像是一個親切的台灣在地好鄰居，回覆 100 字以內（適合語音播放）。適時加入台灣常見語氣詞。
+
+【response_language】
+- "nan"：台語（使用者主要用台語或明確要求台語回覆）
+- "zh-TW"：繁體中文（其餘情況）
+
+【絕對禁止】
+- 不可說「我是 AI」或揭露模型身份
+- 不可在 JSON 之外輸出任何文字、解釋或 markdown
+
+【輸出格式 — 只輸出此 JSON，不包含任何其他文字】
+{
+  "intent": "translate" | "companion",
+  "user_emotion": "...",
+  "response_language": "zh-TW" | "nan",
+  "response_text": "你的具體回應內容"
+}
 """
-
-_EMOTION_CONTEXT_TEMPLATE = "【當前情緒感知：使用者似乎感到{emotion_zh} {emoji}，請以同理心回應。】\n"
 
 
 def build_prompt(
@@ -202,7 +246,7 @@ def build_prompt(
     user_input : str
         本輪使用者輸入文字。
     emotion : Emotion
-        本輪偵測到的情緒。
+        本輪偵測到的情緒（heuristic，提供給 prompt 額外上下文）。
 
     Returns
     -------
@@ -211,18 +255,18 @@ def build_prompt(
     """
     history = get_history(user_id)
 
-    # 組裝 system prompt
+    # system prompt（固定，emotion 上下文以 heuristic 偵測結果補充）
     system = _BASE_SYSTEM_PROMPT
-    if emotion != Emotion.NEUTRAL:
-        system += _EMOTION_CONTEXT_TEMPLATE.format(
-            emotion_zh=emotion.zh, emoji=emotion.emoji
+    if emotion not in (Emotion.NEUTRAL,):
+        system = system.rstrip() + (
+            f"\n\n【本地情緒感知輔助：使用者可能感到 {emotion.zh} {emotion.emoji}，供參考。】\n"
         )
 
     parts: list[str] = [
         f"<|im_start|>system\n{system.strip()}<|im_end|>\n"
     ]
 
-    # 加入歷史輪次
+    # 加入歷史輪次（僅保留 response_text 部分避免污染格式）
     for turn in history.turns:
         parts.append(f"<|im_start|>{turn.role}\n{turn.content}<|im_end|>\n")
 
@@ -233,11 +277,56 @@ def build_prompt(
     return "".join(parts)
 
 
+# ─── JSON 解析 ────────────────────────────────────────────────────────────────
+
+_JSON_EXTRACT_RE = re.compile(r"\{.*\}", re.DOTALL)
+
+
+def parse_llm_json(raw: str, fallback_emotion: Emotion) -> AgentResponse:
+    """
+    解析 LLM 輸出的 JSON 字串，容錯處理各種邊界情況。
+
+    若解析失敗（輸出不合格 JSON），以 raw 文字作為 companion 回覆的 fallback。
+    """
+    # 嘗試從輸出中抽取 JSON 區塊（LLM 可能多輸出文字）
+    m = _JSON_EXTRACT_RE.search(raw)
+    json_str = m.group(0) if m else raw
+
+    try:
+        data = json.loads(json_str)
+        intent_val = data.get("intent", "companion")
+        intent = Intent(intent_val) if intent_val in Intent._value2member_map_ else Intent.COMPANION
+
+        # 嘗試將 LLM 回傳的 emotion 字串對應到 Enum
+        llm_emotion_str = data.get("user_emotion", fallback_emotion.value)
+        try:
+            resolved_emotion = Emotion(llm_emotion_str)
+        except ValueError:
+            resolved_emotion = fallback_emotion
+
+        return AgentResponse(
+            intent=intent,
+            user_emotion=llm_emotion_str,
+            response_language=data.get("response_language", "zh-TW"),
+            response_text=data.get("response_text", raw).strip(),
+            emotion=resolved_emotion,
+        )
+    except (json.JSONDecodeError, KeyError, ValueError) as exc:
+        logger.warning(f"⚠️  LLM JSON 解析失敗（{exc}），使用 fallback 回覆。")
+        return AgentResponse(
+            intent=Intent.COMPANION,
+            user_emotion=fallback_emotion.value,
+            response_language="zh-TW",
+            response_text=raw.strip() or "哎，我剛才沒反應過來，能再說一次嗎？",
+            emotion=fallback_emotion,
+        )
+
+
 # ─── Agent 主流程 ─────────────────────────────────────────────────────────────
 
-async def chat(user_id: str, user_input: str) -> tuple[str, Emotion]:
+async def chat(user_id: str, user_input: str) -> tuple[str, Emotion, str]:
     """
-    完整 Agent 推論流程：情緒偵測 → Prompt 組裝 → LLM 推論 → 更新歷史。
+    完整 Agent 推論流程：情緒偵測 → Prompt 組裝 → LLM 推論（JSON）→ 路由 → 更新歷史。
 
     Parameters
     ----------
@@ -248,34 +337,43 @@ async def chat(user_id: str, user_input: str) -> tuple[str, Emotion]:
 
     Returns
     -------
-    tuple[str, Emotion]
-        (LLM 回覆文字, 偵測到的情緒)
+    tuple[str, Emotion, str]
+        (最終回覆文字, 解析後的情緒, response_language "zh-TW"|"nan")
 
     Raises
     ------
     RuntimeError
         LLM 模型尚未初始化。
     """
-    # 1. 情緒偵測
+    # 1. 本地 heuristic 情緒偵測（作為 LLM 輔助上下文 & fallback）
     emotion = detect_emotion(user_input)
 
     # 2. 組裝 Prompt
     prompt = build_prompt(user_id, user_input, emotion)
 
     logger.debug(
-        f"💬 Agent｜{user_id}｜情緒={emotion.zh}｜"
+        f"💬 Agent｜{user_id}｜heuristic情緒={emotion.zh}｜"
         f"歷史輪數={len(get_history(user_id).turns)}"
     )
 
-    # 3. LLM 推論
-    reply = await generate(prompt)
+    # 3. LLM 推論（期望輸出 JSON）
+    raw_output = await generate(prompt)
 
-    # 4. 更新對話歷史
+    # 4. 解析 JSON 並路由
+    agent_resp = parse_llm_json(raw_output, fallback_emotion=emotion)
+
+    logger.info(
+        f"🎯 路由｜intent={agent_resp.intent.value}｜"
+        f"emotion={agent_resp.user_emotion}｜lang={agent_resp.response_language}｜"
+        f"{agent_resp.response_text[:60]}"
+    )
+
+    # 5. 更新對話歷史（存 response_text 而非整個 JSON，避免污染 next-turn context）
     history = get_history(user_id)
     history.add_user(user_input)
-    history.add_assistant(reply)
+    history.add_assistant(agent_resp.response_text)
 
-    return reply, emotion
+    return agent_resp.response_text, agent_resp.emotion, agent_resp.response_language
 
 
 # ─── 指令解析（簡易規則型） ──────────────────────────────────────────────────────
