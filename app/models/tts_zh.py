@@ -98,9 +98,10 @@ def _get_speaker_emb():
 
 def _do_infer(text: str) -> bytes:
     """
-    同步執行 ChatTTS 推論，回傳 WAV bytes（16kHz mono）。
+    同步執行 ChatTTS 推論，回傳 WAV bytes（24kHz mono）。
 
-    在 executor 中呼叫此函式。
+    兼容 ChatTTS 0.1.x（Chat.InferCodeParams class attr）
+    與 0.2.x+（params 以 dict 傳入 infer()）。
     """
     if _model is None:
         raise RuntimeError("ChatTTS 尚未初始化")
@@ -112,28 +113,49 @@ def _do_infer(text: str) -> bytes:
 
     import ChatTTS  # type: ignore
 
-    params_infer = ChatTTS.Chat.InferCodeParams(
-        spk_emb=_get_speaker_emb(),
-        temperature=0.0003,   # 低 temperature → 更穩定音色
-        top_P=0.7,
-        top_K=20,
-    )
-    params_refine = ChatTTS.Chat.RefineTextParams(
-        prompt="[oral_2][laugh_0][break_6]",  # 適度口語化，不加笑聲
-    )
+    spk_emb = _get_speaker_emb()
 
-    # 推論（回傳 list of np.ndarray，shape=(1, T)）
-    wavs = _model.infer(
-        [text],
-        params_infer_code=params_infer,
-        params_refine_text=params_refine,
-        use_decoder=True,
-        skip_refine_text=False,
-    )
+    # ── 動態偵測 ChatTTS API 版本 ────────────────────────────────────────────
+    # 0.1.x：Chat.InferCodeParams / Chat.RefineTextParams 直接可用
+    # 0.2.x+：改為 params dict，透過 infer() 的 keyword args 傳入
+    try:
+        # 嘗試新版 API（0.2.x+）：直接以 infer_code_params dict 傳入
+        wavs = _model.infer(
+            [text],
+            skip_refine_text=False,
+            refine_text_only=False,
+            params_infer_code={
+                "spk_emb": spk_emb,
+                "temperature": 0.0003,
+                "top_P": 0.7,
+                "top_K": 20,
+            },
+            params_refine_text={
+                "prompt": "[oral_2][laugh_0][break_6]",
+            },
+            use_decoder=True,
+        )
+    except TypeError:
+        # Fallback：舊版 API（0.1.x），params 以 dataclass 傳入
+        params_infer = ChatTTS.Chat.InferCodeParams(
+            spk_emb=spk_emb,
+            temperature=0.0003,
+            top_P=0.7,
+            top_K=20,
+        )
+        params_refine = ChatTTS.Chat.RefineTextParams(
+            prompt="[oral_2][laugh_0][break_6]",
+        )
+        wavs = _model.infer(
+            [text],
+            params_infer_code=params_infer,
+            params_refine_text=params_refine,
+            use_decoder=True,
+            skip_refine_text=False,
+        )
 
     audio_arr = np.squeeze(wavs[0])  # shape: (T,)
 
-    # 寫入 WAV bytes（24kHz → ChatTTS 原生；line 接收時會做重採樣）
     buf = io.BytesIO()
     sf.write(buf, audio_arr, samplerate=24000, format="WAV", subtype="PCM_16")
     return buf.getvalue()
