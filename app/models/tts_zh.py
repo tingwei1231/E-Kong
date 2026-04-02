@@ -135,7 +135,7 @@ def _do_infer(text: str) -> bytes:
             },
             use_decoder=True,
         )
-    except TypeError:
+    except (TypeError, AttributeError):
         # Fallback：舊版 API（0.1.x），params 以 dataclass 傳入
         params_infer = ChatTTS.Chat.InferCodeParams(
             spk_emb=spk_emb,

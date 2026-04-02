@@ -272,7 +272,8 @@ def build_prompt(
 
     # 加入本輪使用者輸入
     parts.append(f"<|im_start|>user\n{user_input}<|im_end|>\n")
-    parts.append("<|im_start|>assistant\n")
+    # 強制 prefill JSON 開頭 '{'，避免太快觸發 stop token 導致空輸出
+    parts.append("<|im_start|>assistant\n{")
 
     return "".join(parts)
 
@@ -382,8 +383,11 @@ async def chat(user_id: str, user_input: str) -> tuple[str, Emotion, str]:
     # 3. LLM 推論（期望輸出 JSON）
     raw_output = await generate(prompt)
 
+    # 因為 prompt prefill 了 '{'，LLM 輸出不會包含首個 '{'，在此補上
+    padded_output = "{" + raw_output
+
     # 4. 解析 JSON 並路由
-    agent_resp = parse_llm_json(raw_output, fallback_emotion=emotion)
+    agent_resp = parse_llm_json(padded_output, fallback_emotion=emotion)
 
     logger.info(
         f"🎯 路由｜intent={agent_resp.intent.value}｜"
