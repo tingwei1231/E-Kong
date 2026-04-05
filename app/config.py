@@ -36,11 +36,18 @@ class Settings(BaseSettings):
     app_port: int = 8000
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
-    # ── LLM (llama.cpp) ───────────────────────────────────────────────────────
-    llm_model_path: str = Field(
-        default="qwen2.5-7b-instruct-q4_k_m.gguf",
-        description="GGUF 模型絕對路徑",
+    # ── LLM ───────────────────────────────────────────────────────────
+    llm_provider: Literal["local", "gemini", "hybrid"] = Field(
+        default="local",
+        description="LLM 提供者：local, gemini, 或 hybrid (本地超時切 API)",
     )
+    google_api_key: str | None = Field(default=None, description="Google AI Studio API Key")
+
+    llm_model_path: str = Field(
+        default="qwen2.5-1.5b-instruct-q4_k_m.gguf",
+        description="GGUF 模型絕對路徑 (建議 1.5B 以利 CPU 運作)",
+    )
+    llm_local_timeout: int = Field(default=60, description="本地推論超時時間（秒），僅 hybrid 模式有效")
     llm_n_gpu_layers: int = Field(default=35, description="GPU offload 層數；-1 表示全量")
     llm_max_tokens: int = 512
     llm_temperature: float = 0.7

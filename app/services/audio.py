@@ -206,7 +206,7 @@ def cleanup_temp_file(path: str) -> None:
 # 流程：WAV bytes → ffmpeg 轉 m4a → 上傳 LINE Blob API → 取 uploadId
 
 _LINE_BLOB_UPLOAD_URL = "https://api-data.line.me/v2/bot/audiomessage/upload"
-_LINE_REPLY_URL_AUDIO = "https://api.line.me/v2/bot/message/reply"
+_LINE_PUSH_URL = "https://api.line.me/v2/bot/message/push"
 
 
 def _wav_bytes_to_m4a(wav_bytes: bytes) -> bytes:
@@ -272,18 +272,18 @@ async def upload_audio_to_line(m4a_bytes: bytes) -> str:
     return upload_id
 
 
-async def reply_audio_message(
-    reply_token: str,
+async def push_audio_message(
+    user_id: str,
     wav_bytes: bytes,
     duration_ms: int = 0,
 ) -> None:
     """
-    將 TTS WAV bytes 轉換為 m4a、上傳至 LINE，並以 Audio Message 回覆。
+    將 TTS WAV bytes 轉換為 m4a、上傳至 LINE，並以 Audio Message 推播。
 
     Parameters
     ----------
-    reply_token : str
-        LINE reply token（30 秒內有效、僅可使用一次）。
+    user_id : str
+        使用者 ID。
     wav_bytes : bytes
         TTS 合成的 WAV 音訊二進位資料。
     duration_ms : int
@@ -308,7 +308,7 @@ async def reply_audio_message(
         "Content-Type": "application/json",
     }
     payload = {
-        "replyToken": reply_token,
+        "to": user_id,
         "messages": [
             {
                 "type": "audio",
@@ -318,9 +318,9 @@ async def reply_audio_message(
         ],
     }
     async with httpx.AsyncClient(timeout=15.0) as client:
-        resp = await client.post(_LINE_REPLY_URL_AUDIO, headers=headers, json=payload)
+        resp = await client.post(_LINE_PUSH_URL, headers=headers, json=payload)
 
     if resp.status_code == 200:
-        logger.info(f"✅ 已回覆語音訊息（uploadId={upload_id[:12]}…）")
+        logger.info(f"✅ 已推播語音訊息（uploadId={upload_id[:12]}…）")
     else:
-        logger.error(f"❌ LINE Audio Reply 失敗 [{resp.status_code}]: {resp.text}")
+        logger.error(f"❌ LINE Audio Push 失敗 [{resp.status_code}]: {resp.text}")

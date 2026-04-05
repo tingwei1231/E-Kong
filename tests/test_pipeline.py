@@ -189,39 +189,12 @@ class TestConversationHistory:
 class TestTTSRouting:
     """測試 TTS 語言路由邏輯。"""
 
-    def test_picks_zh_for_zh(self):
-        from app.services.tts import _pick_engine
-        assert _pick_engine("zh") == "zh"
-
-    def test_picks_tw_for_nan(self):
-        from app.services.tts import _pick_engine
-        assert _pick_engine("nan") == "tw"
-
-    def test_picks_zh_for_none(self):
-        from app.services.tts import _pick_engine
-        assert _pick_engine(None) == "zh"
-
-    def test_picks_zh_for_english(self):
+    def test_picks_zh_for_en(self):
         from app.services.tts import _pick_engine
         assert _pick_engine("en") == "zh"
 
 
-# ─── TTS 台語拼音偵測測試 ─────────────────────────────────────────────────────
-
-class TestRomanizedDetection:
-    """測試 is_romanized() 的漢字比例偵測。"""
-
-    def test_pure_hanzi_is_not_romanized(self):
-        from app.models.tts_tw import is_romanized
-        assert is_romanized("你好我是台灣人") is False
-
-    def test_pure_latin_is_romanized(self):
-        from app.models.tts_tw import is_romanized
-        assert is_romanized("li ho, gua si taiwan lang") is True
-
-    def test_mixed_mostly_latin_is_romanized(self):
-        from app.models.tts_tw import is_romanized
-        assert is_romanized("li ho a") is True
+# ─── Romanized Detection Removed ──────────────────────────────────────────────
 
 
 # ─── 音訊服務測試 ─────────────────────────────────────────────────────────────
@@ -312,12 +285,11 @@ class TestAgentChatFlow:
         assert resp.action["target"] == "all"
 
     @pytest.mark.asyncio
-    async def test_try_reply_audio_returns_false_when_no_tts(self):
-        """TTS 引擎未初始化時 try_reply_audio 應回傳 False。"""
-        from app.services.tts import try_reply_audio
+    async def test_try_push_audio_returns_false_when_no_tts(self):
+        """TTS 引擎未初始化時 try_push_audio 應回傳 False。"""
+        from app.services.tts import try_push_audio
 
-        with patch("app.services.tts.get_tts_zh", return_value=None), \
-             patch("app.services.tts.get_tts_tw", return_value=None):
-            result = await try_reply_audio("fake_token", "測試文字", language="zh")
+        with patch("app.services.tts.get_tts_zh", return_value=None):
+            result = await try_push_audio("fake_user", "測試文字", language="zh")
 
         assert result is False

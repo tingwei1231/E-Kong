@@ -28,12 +28,13 @@ from app.config import get_settings
 from app.models.stt import transcribe
 from app.services.agent import Intent, chat, clear_history, parse_command
 from app.services.audio import cleanup_temp_file, process_line_audio
-from app.services.tts import try_reply_audio
+from app.services.tts import try_push_audio
 
 settings = get_settings()
 
-# LINE Reply API 端點
+# LINE Reply API & Push API 端點
 _LINE_REPLY_URL = "https://api.line.me/v2/bot/message/reply"
+_LINE_PUSH_URL  = "https://api.line.me/v2/bot/message/push"
 
 # 非同步 HTTP client（模組層級單例，重用 connection pool）
 _http_client: httpx.AsyncClient | None = None
@@ -116,6 +117,32 @@ async def reply_text(reply_token: str, text: str) -> None:
         )
 
 
+async def push_text(user_id: str, text: str) -> None:
+    """
+    使用 Push API 主動推播純文字訊息（無回覆時間限制）。
+
+    Parameters
+    ----------
+    user_id : str
+        LINE 使用者 ID。
+    text : str
+        推播的文字內容，最長 5000 字元。
+    """
+    payload = {
+        "to": user_id,
+        "messages": [{"type": "text", "text": text[:5000]}],
+    }
+    client = get_http_client()
+    try:
+        resp = await client.post(_LINE_PUSH_URL, json=payload)
+        resp.raise_for_status()
+        logger.debug(f"✉️  已推播文字訊息（to: {user_id[:8]}…）")
+    except httpx.HTTPStatusError as exc:
+        logger.error(
+            f"LINE Push API 錯誤 [{exc.response.status_code}]: {exc.response.text}"
+        )
+
+
 # ─── 事件路由 ─────────────────────────────────────────────────────────────────
 
 async def handle_text_message(event: dict[str, Any]) -> None:
@@ -128,11 +155,14 @@ async def handle_text_message(event: dict[str, Any]) -> None:
 
     logger.info(f"📩 TextMessage from {user_id}: {text!r}")
 
+    # 即刻使用 reply_token 回覆等待訊息，將 Token 權重有效消耗
+    await reply_text(reply_token, f"⏳ 收到指令：{text[:10]}...\n(因 Colab 資源限制，運算可能需 5~10 分鐘，將在完成後主動推播給您！)")
+
     # ── 指令解析 ───────────────────────────────────────────────────────────────
     cmd = parse_command(text)
     if cmd == "reset":
         clear_history(user_id)
-        await reply_text(reply_token, "🧹 場控記憶已清除，重新開始！")
+        await push_text(user_id, "🧹 場控記憶已清除，重新開始！")
         return
 
     # ── LLM Agent 推論 ─────────────────────────────────────────────────────────
@@ -144,9 +174,9 @@ async def handle_text_message(event: dict[str, Any]) -> None:
         )
 
         # TTS 回覆主辦人
-        voice_ok = await try_reply_audio(reply_token, resp.response_text)
+        voice_ok = await try_push_audio(user_id, resp.response_text)
         if not voice_ok:
-            await reply_text(reply_token, resp.response_text)
+            await push_text(user_id, resp.response_text)
 
         # 後端動作路由
         if resp.intent == Intent.BROADCAST and resp.action:
@@ -157,10 +187,10 @@ async def handle_text_message(event: dict[str, Any]) -> None:
 
     except RuntimeError:
         logger.warning("⚠️  LLM 未就緒，回落 Echo 模式。")
-        await reply_text(reply_token, f"[賽場助理 Echo] {text}")
+        await push_text(user_id, f"[賽場助理 Echo] {text}")
     except Exception as exc:  # noqa: BLE001
         logger.exception(f"文字處理未預期錯誤：{exc}")
-        await reply_text(reply_token, "系統暫時異常，請稍後再試。")
+        await push_text(user_id, "系統暫時異常，請稍後再試。")
 
 
 async def handle_audio_message(event: dict[str, Any]) -> None:
@@ -175,6 +205,9 @@ async def handle_audio_message(event: dict[str, Any]) -> None:
 
     logger.info(f"🎤 AudioMessage id={message_id} from {user_id}")
 
+    # 即刻使用 reply_token 回覆等待訊息
+    await reply_text(reply_token, "⏳ 已收到語音，努力轉譯中...\n(因 Colab 資源限制，運算可能需 5~10 分鐘，將在完成後主動推播給您！)")
+
     wav_path: str | None = None
     try:
         # 1. 下載 LINE 音訊 → 轉換為 16kHz WAV
@@ -184,7 +217,7 @@ async def handle_audio_message(event: dict[str, Any]) -> None:
         result = await transcribe(wav_path)
 
         if not result.text:
-            await reply_text(reply_token, "訊不清楚，能再說一次嗎？🙏")
+            await push_text(user_id, "訊號不清楚，能再說一次嗎？🙏")
             return
 
         logger.info(
@@ -210,19 +243,19 @@ async def handle_audio_message(event: dict[str, Any]) -> None:
             # LLM 尚未初始化 → graceful fallback：回覆 STT 轉錄文字
             reply_msg = f"🗣️ 我聽到你說：{result.text}"
 
-        voice_ok = await try_reply_audio(reply_token, reply_msg)
+        voice_ok = await try_push_audio(user_id, reply_msg)
         if not voice_ok:
-            await reply_text(reply_token, reply_msg)
+            await push_text(user_id, reply_msg)
 
     except FileNotFoundError as exc:
         logger.error(f"音訊檔案不存在：{exc}")
-        await reply_text(reply_token, "音訊下載失敗，請稍後再試。")
+        await push_text(user_id, "音訊下載失敗，請稍後再試。")
     except RuntimeError as exc:
         logger.error(f"STT 失敗：{exc}")
-        await reply_text(reply_token, "語音辨識失敗，請稍後再試。")
+        await push_text(user_id, "語音辨識失敗，請稍後再試。")
     except Exception as exc:  # noqa: BLE001
         logger.exception(f"音訊處理未預期錯誤：{exc}")
-        await reply_text(reply_token, "系統暫時異常，請稍後再試。")
+        await push_text(user_id, "系統暫時異常，請稍後再試。")
     finally:
         # 確保 WAV 暫存檔被清理
         if wav_path:

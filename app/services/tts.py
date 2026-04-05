@@ -19,16 +19,15 @@ from __future__ import annotations
 
 from loguru import logger
 
-from app.models.tts_tw import get_tts_tw, synthesize_tw
 from app.models.tts_zh import get_tts_zh, synthesize_zh
-from app.services.audio import reply_audio_message
+from app.services.audio import push_audio_message
 
 
 # ─── 語言路由 ─────────────────────────────────────────────────────────────────
 
 def _pick_engine(language: str | None) -> str:
-    """依語言代碼選擇 TTS 引擎（"tw" 或 "zh"）。"""
-    return "tw" if language == "nan" else "zh"
+    """依語言代碼選擇 TTS 引擎（目前全由中文引擎負責）。"""
+    return "zh"
 
 
 async def synthesize(text: str, language: str | None = None) -> bytes | None:
@@ -49,10 +48,8 @@ async def synthesize(text: str, language: str | None = None) -> bytes | None:
     """
     engine = _pick_engine(language)
     try:
-        if engine == "tw" and get_tts_tw() is not None:
-            logger.debug(f"🎤 台語 TTS（MMS）：{text[:30]}…")
-            return await synthesize_tw(text)
-        elif get_tts_zh() is not None:
+        # 強制使用中文 TTS
+        if get_tts_zh() is not None:
             logger.debug(f"🎤 中文 TTS（ChatTTS）：{text[:30]}…")
             return await synthesize_zh(text)
         else:
@@ -63,18 +60,18 @@ async def synthesize(text: str, language: str | None = None) -> bytes | None:
         return None
 
 
-async def try_reply_audio(
-    reply_token: str,
+async def try_push_audio(
+    user_id: str,
     text: str,
     language: str | None = None,
 ) -> bool:
     """
-    嘗試合成語音並以 LINE Audio Message 回覆。
+    嘗試合成語音並以 LINE Audio Message 推播。
 
     Parameters
     ----------
-    reply_token : str
-        LINE reply token（30 秒內有效、僅可使用一次）。
+    user_id : str
+        LINE 使用者 ID。
     text : str
         LLM 回覆文字（TTS 輸入）。
     language : str | None
@@ -83,16 +80,16 @@ async def try_reply_audio(
     Returns
     -------
     bool
-        True 表示語音回覆成功；False 表示失敗（呼叫方應改用純文字）。
+        True 表示語音推播成功；False 表示失敗（呼叫方應改用純文字）。
     """
     wav_bytes = await synthesize(text, language)
     if wav_bytes is None:
         return False
 
     try:
-        await reply_audio_message(reply_token, wav_bytes)
+        await push_audio_message(user_id, wav_bytes)
         return True
     except Exception as exc:  # noqa: BLE001
-        logger.warning(f"⚠️  LINE 語音回覆失敗：{exc}")
+        logger.warning(f"⚠️  LINE 語音推播失敗：{exc}")
         return False
 

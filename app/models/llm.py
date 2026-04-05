@@ -15,8 +15,9 @@ from __future__ import annotations
 
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
-from typing import Iterator
+from typing import Any
 
+import httpx
 from llama_cpp import Llama
 from loguru import logger
 
@@ -112,30 +113,78 @@ async def generate(
     stop: list[str] | None = None,
 ) -> str:
     """
-    以給定 prompt 執行 LLM 推論，回傳生成文字。
-
-    Parameters
-    ----------
-    prompt : str
-        已組裝完成的完整 prompt（含系統指令與對話歷史）。
-    max_tokens : int | None
-        最大生成 token 數；None 則使用 settings.llm_max_tokens。
-    temperature : float | None
-        溫度；None 則使用 settings.llm_temperature。
-    stop : list[str] | None
-        停止詞列表，遇到即停止生成。
-
-    Returns
-    -------
-    str
-        LLM 生成的回覆文字（已 strip 首尾空白）。
-
-    Raises
-    ------
-    RuntimeError
-        模型尚未初始化。
+    呼叫 LLM（依設定自動選擇 Local 模式、API 模式或 Hybrid 模式）。
     """
-    logger.debug("進入 generate 函式，準備取得 LLM 實例...")
+    provider = settings.llm_provider
+    
+    if provider == "gemini":
+        return await _generate_gemini(prompt, max_tokens, temperature, stop)
+    
+    elif provider == "hybrid":
+        # ── Hybrid 模式：本地優先，逾時切 API ──────────────────────────────
+        try:
+            logger.info(f"⏳ [Hybrid] 嘗試本地推論 (限時 {settings.llm_local_timeout} 秒)...")
+            # 使用 wait_for 限制本地推論時間
+            return await asyncio.wait_for(
+                _generate_local(prompt, max_tokens, temperature, stop),
+                timeout=float(settings.llm_local_timeout)
+            )
+        except asyncio.TimeoutError:
+            logger.warning(f"⚠️  本地推論逾時 ({settings.llm_local_timeout}s)，自動切換至 Gemini API 救援！")
+            # 注意：本地推論 Task 仍會在 ThreadPoolExecutor 背景跑完，只是我們不再等待它。
+            return await _generate_gemini(prompt, max_tokens, temperature, stop)
+        except Exception as e:
+            logger.error(f"❌ 本地推論發生錯誤，切換至 Gemini 作為備援：{e}")
+            return await _generate_gemini(prompt, max_tokens, temperature, stop)
+            
+    else:
+        # 預設：純本地模式
+        return await _generate_local(prompt, max_tokens, temperature, stop)
+
+
+async def _generate_gemini(
+    prompt: str,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    stop: list[str] | None = None,
+) -> str:
+    """透過 Google Gemini API 進行高速推論。"""
+    if not settings.google_api_key:
+        logger.error("❌ llm_provider 設為 gemini 但未提供 GOOGLE_API_KEY！")
+        return "⚠️ [系統錯誤] LLM API 金鑰未設定。"
+
+    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={settings.google_api_key}"
+    payload = {
+        "contents": [{"parts": [{"text": prompt}]}],
+        "generationConfig": {
+            "maxOutputTokens": max_tokens or settings.llm_max_tokens,
+            "temperature": temperature if temperature is not None else settings.llm_temperature,
+            "stopSequences": stop or ["<|im_end|>"]
+        }
+    }
+    
+    logger.debug("🔵 Gemini API 呼叫中...")
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            resp = await client.post(url, json=payload)
+            resp.raise_for_status()
+            data = resp.json()
+            text = data["candidates"][0]["content"]["parts"][0]["text"]
+            logger.debug(f"✅ Gemini API 回傳成功！長度={len(text)}")
+            return text.strip()
+        except Exception as e:
+            logger.error(f"❌ Gemini API 失敗：{e}")
+            return f"⚠️ [API 錯誤] 暫時無法連接模型：{e}"
+
+
+async def _generate_local(
+    prompt: str,
+    max_tokens: int | None = None,
+    temperature: float | None = None,
+    stop: list[str] | None = None,
+) -> str:
+    """原本的 llama.cpp 本地推論邏輯。"""
+    logger.debug("進入 generate 模式：Local CPU/GPU...")
     model = get_llm()
     _max_tokens = max_tokens or settings.llm_max_tokens
     _temperature = temperature if temperature is not None else settings.llm_temperature

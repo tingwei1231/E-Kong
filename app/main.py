@@ -21,7 +21,6 @@ from app.config import get_settings
 from app.line_handler import close_http_client, dispatch_events, verify_line_signature
 from app.models.llm import close_llm, init_llm
 from app.models.stt import close_stt, init_stt
-from app.models.tts_tw import close_tts_tw, init_tts_tw
 from app.models.tts_zh import close_tts_zh, init_tts_zh
 
 settings = get_settings()
@@ -58,18 +57,12 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     except Exception as exc:  # noqa: BLE001
         logger.warning(f"⚠️  ChatTTS 載入失敗，中文語音不可用：{exc}")
 
-    try:
-        await init_tts_tw()
-    except Exception as exc:  # noqa: BLE001
-        logger.warning(f"⚠️  MMS-TTS 載入失敗，台語語音不可用：{exc}")
-
     yield  # ← 應用正常運行期間
 
     # ── 清理資源 ────────────────────────────────────────────────────────────
     await close_http_client()
     await close_stt()
     await close_llm()
-    await close_tts_tw()
     await close_tts_zh()
     logger.info("🛑 Ē-Kóng FastAPI 已正常關閉。")
 
