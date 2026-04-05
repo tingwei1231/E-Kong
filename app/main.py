@@ -18,7 +18,7 @@ from fastapi.responses import JSONResponse, PlainTextResponse
 from loguru import logger
 
 from app.config import get_settings
-from app.line_handler import close_http_client, dispatch_events
+from app.line_handler import close_http_client, dispatch_events, verify_line_signature
 from app.models.llm import close_llm, init_llm
 from app.models.stt import close_stt, init_stt
 from app.models.tts_tw import close_tts_tw, init_tts_tw
@@ -103,16 +103,26 @@ async def global_exception_handler(request: Request, exc: Exception) -> JSONResp
 
 # ─── 路由 ─────────────────────────────────────────────────────────────────────
 
+from fastapi import BackgroundTasks
+
 @app.post("/webhook", status_code=200, summary="LINE Webhook 接收端點")
-async def webhook(request: Request, x_line_signature: str = Header(...)) -> PlainTextResponse:
+async def webhook(
+    request: Request,
+    background_tasks: BackgroundTasks,
+    x_line_signature: str = Header(...)
+) -> PlainTextResponse:
     """
     LINE Messaging API Webhook 端點。
 
     流程：
-      1. 委派 `dispatch_events` 驗證簽名並路由事件
-      2. 回傳 200 OK（LINE 需在 1 秒內收到回應）
+      1. 讀取 body 並同步驗證簽名
+      2. 將事件委派給 `dispatch_events` 在背景執行
+      3. 立即回傳 200 OK（確保 LINE 1 秒內收到以避免重試斷線死結）
     """
-    await dispatch_events(request, x_line_signature)
+    body: bytes = await request.body()
+    verify_line_signature(body, x_line_signature)
+    
+    background_tasks.add_task(dispatch_events, body)
     return PlainTextResponse("OK")
 
 

@@ -246,18 +246,14 @@ async def handle_follow_event(event: dict[str, Any]) -> None:
 
 # ─── 主進入點 ──────────────────────────────────────────────────────────────────
 
-async def dispatch_events(request: Request, x_line_signature: str) -> None:
+async def dispatch_events(body: bytes) -> None:
     """
-    Webhook 主處理函式；由 FastAPI router 呼叫。
+    Webhook 背景處理函式。
 
     流程：
-      1. 讀取 body → 驗證簽名
-      2. 解析 events 陣列
-      3. 依 event type 路由至對應 handler
+      1. 解析 events 陣列
+      2. 依 event type 路由至對應 handler
     """
-    body: bytes = await request.body()
-    verify_line_signature(body, x_line_signature)
-
     payload: dict[str, Any] = json.loads(body)
     events: list[dict[str, Any]] = payload.get("events", [])
 
