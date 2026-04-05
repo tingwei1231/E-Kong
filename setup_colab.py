@@ -38,8 +38,9 @@ LINE_CHANNEL_ACCESS_TOKEN: str = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 APP_PORT: int = int(os.getenv("APP_PORT", "8000"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
-# llama-cpp-python 版本（透過原始碼編譯安裝以支援最新 Colab CUDA 環境）
-LLAMA_CPP_VERSION = "0.2.90"  # 鎖版本確保可重現，可視需求升級
+# llama-cpp-python 版本 (針對 Colab CUDA 12.2+ 與 Python 3.12)
+LLAMA_CPP_VERSION = "0.3.5"
+LLAMA_CPP_INDEX_URL = "https://abetlen.github.io/llama-cpp-python/whl/cu124"
 
 # ─── Logger ────────────────────────────────────────────────────────────────────
 logger.remove()
@@ -92,20 +93,16 @@ def install_requirements() -> None:
         "-q", "-r", str(req_path),
     ])
 
-    logger.info(f"⚡ 從原始碼編譯安裝 CUDA 版 llama-cpp-python=={LLAMA_CPP_VERSION} (這可能需要 2-3 分鐘)...")
-    env = os.environ.copy()
-    env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
-    env["FORCE_CMAKE"] = "1"
-    
+    logger.info(f"⚡ 安裝 CUDA 版 llama-cpp-python=={LLAMA_CPP_VERSION}...")
     subprocess.check_call([
         sys.executable, "-m", "pip", "install",
         "-q",
         "--upgrade",
         "--force-reinstall",
-        "--no-cache-dir",
         "--no-deps",
         f"llama-cpp-python=={LLAMA_CPP_VERSION}",
-    ], env=env)
+        "--extra-index-url", LLAMA_CPP_INDEX_URL,
+    ])
     logger.success("✅ 所有依賴安裝完成。")
 
 
@@ -208,13 +205,19 @@ def start_server(port: int) -> subprocess.Popen:
     subprocess.Popen
         uvicorn 子程序 handle（可用於後續監控或終止）。
     """
-    # 確保強制砍掉先前的 uvicorn process，避免 port 衝突 ([Errno 98] Address already in use)
+    # 確保強制砍掉先前的 uvicorn process
     try:
         os.system("pkill -f uvicorn")
         time.sleep(1)
     except Exception as e:
         logger.debug(f"清理舊 uvicorn 時略過：{e}")
 
+    # 針對 Colab，強制注入 CUDA 函式庫路徑，避免 libcudart.so.12 找不到
+    cuda_path = "/usr/local/cuda/lib64"
+    current_ld = os.environ.get("LD_LIBRARY_PATH", "")
+    if cuda_path not in current_ld:
+        os.environ["LD_LIBRARY_PATH"] = f"{cuda_path}:{current_ld}" if current_ld else cuda_path
+        
     cmd = [
         sys.executable, "-m", "uvicorn",
         "app.main:app",
