@@ -55,6 +55,8 @@ async def init_tts_zh() -> None:
             def _load() -> "ChatTTS.Chat":
                 chat = ChatTTS.Chat()
                 chat.load(compile=False)  # compile=True 會提速但首次編譯慢
+                if not hasattr(chat, 'gpt') or chat.gpt is None:
+                    raise RuntimeError("ChatTTS 模組內部模型 .gpt 載入失敗！可能是網路或依賴庫不相容。")
                 return chat
 
             _model = await loop.run_in_executor(None, _load)

@@ -182,28 +182,26 @@ _REJECT_UPDATE_TEXT = (
 )
 
 
-def _build_system_prompt() -> str:
-    """組裝含靜態賽事手冊的完整 System Prompt。"""
+def _build_system_prompt(include_schedule: bool = False) -> str:
+    """組裝 System Prompt。可選擇是否包含靜態賽事手冊。"""
     static_section = (
         f"\n【靜態賽事手冊（請優先依此回答賽制、地點、規則等問題）】\n{_SCHEDULE_STATIC}\n"
-        if _SCHEDULE_STATIC else ""
+        if (_SCHEDULE_STATIC and include_schedule) else ""
     )
     return _BASE_SYSTEM_PROMPT.strip() + static_section
-
-
-_FULL_SYSTEM_PROMPT: str = _build_system_prompt()
 
 
 def build_prompt(
     user_id: str,
     user_input: str,
     tool_context: str | None = None,
+    include_schedule: bool = False,
 ) -> str:
-    """組裝完整 ChatML 格式 Prompt，動態注入工具查詢結果。"""
+    """組裝完整 ChatML 格式 Prompt，動態注入工具查詢結果或手冊。"""
     history = get_history(user_id)
-    system  = _FULL_SYSTEM_PROMPT
+    system  = _build_system_prompt(include_schedule)
     if tool_context:
-        system = system.rstrip() + f"\n\n【本輪工具查詢結果（優先依此回答）】\n{tool_context}\n"
+        system = system.rstrip() + f"\n\n【本輪相關資訊（優先依此回答）】\n{tool_context}\n"
 
     parts: list[str] = [f"<|im_start|>system\n{system}<|im_end|>\n"]
     for turn in history.turns:
@@ -310,7 +308,7 @@ async def chat(user_id: str, user_input: str) -> AgentResponse:
 
     # ── 第一輪 LLM：intent 分類 ──────────────────────────────────────────────
     logger.debug("開始組裝分類 Prompt...")
-    prompt_classify     = build_prompt(user_id, user_input)
+    prompt_classify     = build_prompt(user_id, user_input, include_schedule=False)
     logger.debug(f"分類 Prompt 組裝完成 (長度: {len(prompt_classify)})，準備呼叫 LLM...")
     try:
         raw_classify    = await generate(prompt_classify)
@@ -347,12 +345,29 @@ async def chat(user_id: str, user_input: str) -> AgentResponse:
     elif agent_resp.intent == Intent.QUERY_SCHEDULE:
         tool_context = _run_schedule_tool(qparams)
         logger.info(f"📅 賽程查詢｜type={qparams.get('type')}｜{tool_context[:80]}")
+        
+    elif agent_resp.intent == Intent.GENERAL_CHAT:
+        # General_Chat 需要 schedule.md 作為知識庫進行第二輪對話回答
+        logger.info("閒聊/問答意圖，準備第二輪 LLM 檢索賽事手冊")
+        tool_context = _SCHEDULE_STATIC
 
-    # ── 第二輪 LLM（僅工具查詢後才需要）──────────────────────────────────
-    if tool_context:
-        prompt_final       = build_prompt(user_id, user_input, tool_context=tool_context)
+    # ── 第二輪 LLM（需要參考資料時觸發）──────────────────────────────────
+    if tool_context or agent_resp.intent == Intent.GENERAL_CHAT:
+        prompt_final       = build_prompt(
+            user_id, 
+            user_input, 
+            tool_context=tool_context if agent_resp.intent != Intent.GENERAL_CHAT else None,
+            include_schedule=True
+        )
+        logger.debug(f"準備進行第二輪 LLM 回答... Prompt 長度: {len(prompt_final)}")
         raw_final          = await generate(prompt_final)
-        agent_resp, _      = parse_llm_json(raw_final)
+        final_agent_resp, _ = parse_llm_json(raw_final)
+        
+        # 保留第一輪解析出的 Intent 和 query_params，只替換最終回答
+        agent_resp.response_text = final_agent_resp.response_text
+        if final_agent_resp.action:
+            agent_resp.action = final_agent_resp.action
+            
         logger.info(f"🗣️  最終回覆｜{agent_resp.response_text[:80]}")
 
     # ── 更新對話歷史 ────────────────────────────────────────────────────────
