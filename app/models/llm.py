@@ -146,22 +146,42 @@ async def generate(
 
     def _sync_inference():
         logger.debug("🚀 _executor 執行緒開始跑 model.create_completion...")
-        result = model.create_completion(
-            prompt,
-            max_tokens=_max_tokens,
-            temperature=_temperature,
-            stop=_stop,
-            echo=False,         # 不回傳 prompt 本身
-            stream=False,
-        )
-        logger.debug("✅ model.create_completion 返回了！")
-        return result
+        try:
+            generator = model.create_completion(
+                prompt,
+                max_tokens=_max_tokens,
+                temperature=_temperature,
+                stop=_stop,
+                echo=False,         # 不回傳 prompt 本身
+                stream=True,        # 開啟 Streaming 以免看起來卡住
+            )
+            logger.debug("... prompt 處理完畢，開始生成 Token ...")
+            
+            full_text = []
+            finish_reason = "stop"
+            for idx, chunk in enumerate(generator):
+                if chunk and "choices" in chunk and chunk["choices"]:
+                    delta = chunk["choices"][0].get("text", "")
+                    reason = chunk["choices"][0].get("finish_reason")
+                    if delta:
+                        full_text.append(delta)
+                        if idx % 10 == 0:
+                            logger.debug(f"⏳ 生成中 Token ({idx})... {delta!r}")
+                    if reason:
+                        finish_reason = reason
+            
+            final_text = "".join(full_text)
+            logger.debug("✅ model.create_completion 串流返回完畢！")
+            return {"text": final_text, "finish_reason": finish_reason}
+        except Exception as e:
+            logger.error(f"❌ _sync_inference 嚴重錯誤: {e}")
+            raise
 
     output = await loop.run_in_executor(_executor, _sync_inference)
     logger.debug("👉 等待 run_in_executor 完成...")
 
-    text: str = output["choices"][0]["text"].strip()
-    finish_reason: str = output["choices"][0]["finish_reason"]
+    text: str = output["text"].strip()
+    finish_reason: str = output["finish_reason"]
 
     if finish_reason == "length":
         logger.warning("⚠️  LLM 達到 max_tokens 限制，回覆可能截斷。")
