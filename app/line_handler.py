@@ -4,7 +4,7 @@ app/line_handler.py — LINE Messaging API 事件處理器
 職責：
   - 接收並驗證 LINE Webhook 簽名
   - 路由各類型事件（TextMessage、AudioMessage、…）
-  - Step 1：實作 Echo Bot；後續 Step 替換為 STT/LLM/TTS 管線
+  - 文字 / 語音 → STT → LLM Agent（Update_Score / Broadcast / General_Chat）→ TTS
 
 設計原則：
   - 每種事件獨立方法，便於後續擴充
@@ -26,7 +26,7 @@ from loguru import logger
 
 from app.config import get_settings
 from app.models.stt import transcribe
-from app.services.agent import chat, clear_history, parse_command
+from app.services.agent import Intent, chat, clear_history, parse_command
 from app.services.audio import cleanup_temp_file, process_line_audio
 from app.services.tts import try_reply_audio
 
@@ -120,7 +120,7 @@ async def reply_text(reply_token: str, text: str) -> None:
 
 async def handle_text_message(event: dict[str, Any]) -> None:
     """
-    處理文字訊息事件：指令解析 → 情緒偵測 → LLM 推論 → 回覆。
+    處理文字訊息事件：指令解析 → LLM 推論（Update_Score/Broadcast/General_Chat）→ TTS 回覆。
     """
     reply_token: str = event["replyToken"]
     user_id: str = event["source"].get("userId", "unknown")
@@ -132,22 +132,32 @@ async def handle_text_message(event: dict[str, Any]) -> None:
     cmd = parse_command(text)
     if cmd == "reset":
         clear_history(user_id)
-        await reply_text(reply_token, "🧹 記憶已清除，我們重新開始吧！😊")
+        await reply_text(reply_token, "🧹 場控記憶已清除，重新開始！")
         return
 
-    # ── LLM Agent 推論 ───────────────────────────────────────────────────────────
+    # ── LLM Agent 推論 ─────────────────────────────────────────────────────────
     try:
-        reply, emotion, resp_lang = await chat(user_id, text)
-        logger.info(f"✅ LLM│{user_id}│{emotion.zh}{emotion.emoji}│lang={resp_lang}│{reply[:60]}")
-        # "nan" → 台語 TTS，其餘 → None（中文 TTS）
-        tts_lang = resp_lang if resp_lang == "nan" else None
-        voice_ok = await try_reply_audio(reply_token, reply, language=tts_lang)
+        resp = await chat(user_id, text)
+        logger.info(
+            f"✅ LLM│{user_id}│intent={resp.intent.value}│"
+            f"action={resp.action}│{resp.response_text[:60]}"
+        )
+
+        # TTS 回覆主辦人
+        voice_ok = await try_reply_audio(reply_token, resp.response_text)
         if not voice_ok:
-            await reply_text(reply_token, reply)
+            await reply_text(reply_token, resp.response_text)
+
+        # 後端動作路由
+        if resp.intent == Intent.BROADCAST and resp.action:
+            logger.info(f"📢 Broadcast action: {resp.action}")
+        elif resp.intent == Intent.REJECT_UPDATE:
+            pass  # 已在 agent.chat() 短路，不觸發任何工具
+        # Query_Score_Status：工具呼叫已在 agent.chat() 內完成，此處無需處理
+
     except RuntimeError:
-        # LLM 尚未初始化（例：模型檔案不存在）→ 回落 Echo
         logger.warning("⚠️  LLM 未就緒，回落 Echo 模式。")
-        await reply_text(reply_token, f"[Ē-Kóng Echo] {text}")
+        await reply_text(reply_token, f"[賽場助理 Echo] {text}")
     except Exception as exc:  # noqa: BLE001
         logger.exception(f"文字處理未預期錯誤：{exc}")
         await reply_text(reply_token, "系統暫時異常，請稍後再試。")
@@ -181,25 +191,28 @@ async def handle_audio_message(event: dict[str, Any]) -> None:
             f"✅ STT｜{user_id}｜語言={result.language}（{result.language_probability:.0%}）｜{result.text!r}"
         )
 
-        # 3. LLM        # STT 完成後進 LLM Agent
+        # 3. LLM Agent 推論（STT 結果直接餵入）
         try:
-            reply, emotion, resp_lang = await chat(user_id, result.text)
-            logger.info(f"✅ LLM│{user_id}│{emotion.zh}{emotion.emoji}│lang={resp_lang}│{reply[:60]}")
+            resp = await chat(user_id, result.text)
+            logger.info(
+                f"✅ LLM│{user_id}│intent={resp.intent.value}│"
+                f"action={resp.action}│{resp.response_text[:60]}"
+            )
+            reply_msg = resp.response_text
+
+            # 後端動作路由
+            if resp.intent == Intent.BROADCAST and resp.action:
+                logger.info(f"📢 Broadcast action: {resp.action}")
+            elif resp.intent == Intent.REJECT_UPDATE:
+                pass  # 已短路，無工具呼叫
+
         except RuntimeError:
             # LLM 尚未初始化 → graceful fallback：回覆 STT 轉錄文字
-            lang_label = {"zh": "🇨🇳 中文", "nan": "🇹🇼 台語"}.get(
-                result.language, result.language.upper()
-            )
-            reply = (
-                f"🗣️ 我聽到你說（{lang_label}）：\n{result.text}"
-            )
-            resp_lang = result.language  # STT 偵測語言當 fallback
+            reply_msg = f"🗣️ 我聽到你說：{result.text}"
 
-        # TTS 語音回覆（"nan" → 台語 TTS；其餘 → None/中文）
-        tts_lang = resp_lang if resp_lang == "nan" else None
-        voice_ok = await try_reply_audio(reply_token, reply, language=tts_lang)
+        voice_ok = await try_reply_audio(reply_token, reply_msg)
         if not voice_ok:
-            await reply_text(reply_token, reply)
+            await reply_text(reply_token, reply_msg)
 
     except FileNotFoundError as exc:
         logger.error(f"音訊檔案不存在：{exc}")
@@ -223,8 +236,11 @@ async def handle_follow_event(event: dict[str, Any]) -> None:
     logger.info(f"👋 Follow event from {user_id}")
     await reply_text(
         reply_token,
-        "你好！我是 Ē-Kóng (會講)，你的中台語語音陪伴助手。\n"
-        "傳訊或傳語音給我，我來陪你聊天！😊",
+        "嗨！我是賽場助理 🏐\n"
+        "你可以透過語音或文字下達指令：\n"
+        "・更新比分 → 說出場次與比數\n"
+        "・全場廣播 → 告訴我廣播內容\n"
+        "・詢問賽事資訊 → 直接問我！",
     )
 
 

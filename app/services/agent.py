@@ -1,24 +1,28 @@
 """
-app/services/agent.py — 情緒感知 LLM Agent 服務
+app/services/agent.py — 排球錦標賽語音場控 Agent
 =================================================
 職責：
-  1. 對話歷史管理（In-memory，per-user，環形緩衝）
-  2. 情緒偵測（關鍵詞 + 標點啟發式規則，輕量快速）
-  3. 系統 Prompt 組裝（含角色設定 + JSON 輸出格式要求）
+  1. 載入 app/data/schedule.md（靜態賽事資訊，注入 System Prompt）
+  2. 對話歷史管理（In-memory，per-user，環形緩衝）
+  3. 系統 Prompt 組裝（靜態手冊 + JSON 格式指示）
   4. 呼叫 llm.generate() 取得 JSON 回覆，並解析路由
+  5. 意圖防護：Reject_Update 攔截所有語音更新請求
 
-設計原則：
-  - 歷史記錄以 deque(maxlen=N) 實作環形緩衝，防記憶體無限增長
-  - LLM 強制輸出 JSON {intent, user_emotion, response_language, response_text}
-  - intent="translate" → 直接翻譯；intent="companion" → 情緒陪伴回覆
-  - TAIDE / Llama-3 均使用 ChatML 格式（<|im_start|> … <|im_end|>）
+五種 Intent：
+  - Query_Score_Status：查詢即時比分（→ tool_query_google_sheet）
+  - Query_Schedule    ：查詢賽程/分組/積分/晉淘（→ tool_query_schedule 等）
+  - Broadcast         ：全場廣播
+  - Reject_Update     ：企圖更新比分 → 硬短路
+  - General_Chat      ：一般詢問（直接由 LLM + schedule.md 回答）
 
-Prompt 格式（ChatML）：
-  <|im_start|>system
-  {system_prompt}<|im_end|>
-  <|im_start|>user
-  {user_msg}<|im_end|>
-  <|im_start|>assistant
+Context 架構：
+  ┌─ System Prompt（固定）
+  │    ├─ 角色定義 + 五種 Intent 說明
+  │    └─ schedule.md 靜態全文（啟動時一次載入）
+  │
+  └─ Tool Context（動態，每輪請求按需查詢）
+       ├─ Query_Score_Status → 即時比分
+       └─ Query_Schedule     → 賽程/分組/積分/晉淘
 """
 
 from __future__ import annotations
@@ -28,136 +32,52 @@ import re
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
+from pathlib import Path
 from typing import Deque
 
 from loguru import logger
 
 from app.models.llm import generate
-
-
-# ─── 情緒枚舉 ──────────────────────────────────────────────────────────────────
-
-class Emotion(str, Enum):
-    """偵測到的情緒類別。"""
-    HAPPY     = "happy"
-    SAD       = "sad"
-    ANXIOUS   = "anxious"
-    ANGRY     = "angry"
-    LONELY    = "lonely"
-    EXHAUSTED = "exhausted"
-    NEUTRAL   = "neutral"
-
-    @property
-    def zh(self) -> str:
-        """中文標籤（用於 Prompt 組裝）。"""
-        return {
-            "happy":     "開心",
-            "sad":       "難過",
-            "anxious":   "焦慮",
-            "angry":     "生氣",
-            "lonely":    "孤獨",
-            "exhausted": "疲憊",
-            "neutral":   "平靜",
-        }[self.value]
-
-    @property
-    def emoji(self) -> str:
-        return {
-            "happy": "😊", "sad": "😢", "anxious": "😰",
-            "angry": "😤", "lonely": "🥺", "exhausted": "😩",
-            "neutral": "😌",
-        }[self.value]
+from app.services.tools import (
+    MatchQueryResult,
+    format_match_result_for_llm,
+    tool_query_elimination,
+    tool_query_google_sheet,
+    tool_query_groups,
+    tool_query_loser_standings,
+    tool_query_standings,
+)
 
 
 # ─── Intent 枚舉 ──────────────────────────────────────────────────────────────
 
 class Intent(str, Enum):
-    """使用者意圖類別。"""
-    TRANSLATE = "translate"   # 明確要求翻譯
-    COMPANION = "companion"   # 閒聊 / 情緒陪伴
+    QUERY_SCORE_STATUS = "Query_Score_Status"  # 即時比分查詢（唯讀）
+    QUERY_SCHEDULE     = "Query_Schedule"       # 賽程/分組/積分/晉淘查詢
+    BROADCAST          = "Broadcast"            # 全場廣播
+    REJECT_UPDATE      = "Reject_Update"        # 企圖更新比分 → 攔截
+    GENERAL_CHAT       = "General_Chat"         # 一般詢問（用 schedule.md 回答）
 
 
 # ─── Agent 回應結構 ────────────────────────────────────────────────────────────
 
 @dataclass
 class AgentResponse:
-    """解析後的 LLM JSON 輸出。"""
-    intent:            Intent
-    user_emotion:      str      # LLM 自行判斷的情緒字串（如 "sad", "exhausted"）
-    response_language: str      # "zh-TW" | "nan"
-    response_text:     str      # 實際回覆內容
-    emotion:           Emotion  # 本地 heuristic 偵測結果（保留供 TTS 參考）
-
-
-# ─── 情緒偵測（輕量 heuristic，Step 4 後可替換 BERT 分類器）───────────────────
-
-# 關鍵詞對應情緒類別（中文 + 台語羅馬拼音常見詞）
-_EMOTION_KEYWORDS: dict[Emotion, list[str]] = {
-    Emotion.HAPPY:     ["開心", "高興", "快樂", "棒", "太好了", "哈哈", "😄", "🎉", "爽", "讚"],
-    Emotion.SAD:       ["難過", "傷心", "哭", "可憐", "失落", "沮喪", "心痛", "痛苦", "😢", "😭"],
-    Emotion.ANXIOUS:   ["擔心", "焦慮", "緊張", "不安", "怕", "害怕", "恐慌", "壓力", "😰", "😨"],
-    Emotion.ANGRY:     ["氣", "生氣", "憤怒", "煩", "討厭", "幹", "靠", "怒", "😤", "😠"],
-    Emotion.LONELY:    ["寂寞", "孤獨", "孤單", "沒人", "沒朋友", "想你", "思念", "🥺", "😔"],
-    Emotion.EXHAUSTED: ["累", "好累", "疲憊", "沒力", "撐不住", "精疲力竭", "😩", "🥱"],
-}
-
-# 問句 / 感嘆號多 → 焦慮傾向
-_ANXIOUS_PATTERN = re.compile(r"[？?!！]{2,}")
-
-
-def detect_emotion(text: str) -> Emotion:
-    """
-    對輸入文字做輕量情緒偵測，回傳最可能的情緒類別。
-
-    演算法：關鍵詞命中計分，最高分勝；平手或零命中回傳 NEUTRAL。
-    可在 Step 4 替換為 BERT 情緒分類模型以提升準確度。
-
-    Parameters
-    ----------
-    text : str
-        使用者輸入文字（STT 轉錄或直接文字訊息）。
-
-    Returns
-    -------
-    Emotion
-        情緒類別。
-    """
-    scores: dict[Emotion, int] = {e: 0 for e in Emotion}
-
-    for emotion, keywords in _EMOTION_KEYWORDS.items():
-        for kw in keywords:
-            if kw in text:
-                scores[emotion] += 1
-
-    # 焦慮規則：多個問號/感嘆號
-    if _ANXIOUS_PATTERN.search(text):
-        scores[Emotion.ANXIOUS] += 1
-
-    best_emotion = max(scores, key=lambda e: scores[e])
-    if scores[best_emotion] == 0:
-        return Emotion.NEUTRAL
-
-    logger.debug(f"🎭 情緒偵測：{best_emotion.zh}（{best_emotion.emoji}）｜scores={dict(scores)}")
-    return best_emotion
+    intent:        Intent
+    response_text: str
+    action:        dict | None  # 僅 Broadcast 有值，其餘 None
 
 
 # ─── 對話歷史 ─────────────────────────────────────────────────────────────────
 
 @dataclass
 class Turn:
-    """單輪對話。"""
-    role: str    # "user" | "assistant"
+    role: str
     content: str
 
 
 @dataclass
 class ConversationHistory:
-    """
-    單一使用者的對話歷史（環形緩衝）。
-
-    maxlen 控制最多保留幾輪；超出後自動丟棄最舊的記錄，
-    防止 context window 爆滿。
-    """
     maxlen: int = 10
     turns: Deque[Turn] = field(default_factory=lambda: deque(maxlen=10))
 
@@ -171,256 +91,269 @@ class ConversationHistory:
         self.turns.clear()
 
 
-# ─── In-memory 歷史倉儲（key = LINE user_id）─────────────────────────────────
-
 _histories: dict[str, ConversationHistory] = {}
 
 
 def get_history(user_id: str) -> ConversationHistory:
-    """取得或建立指定使用者的對話歷史。"""
     if user_id not in _histories:
         _histories[user_id] = ConversationHistory()
     return _histories[user_id]
 
 
 def clear_history(user_id: str) -> None:
-    """清除指定使用者的對話歷史（用於「重設」指令）。"""
     if user_id in _histories:
         _histories[user_id].clear()
         logger.info(f"🗑️  已清除 {user_id} 的對話歷史。")
 
 
+# ─── 靜態賽事手冊載入 ────────────────────────────────────────────────────────
+
+_SCHEDULE_MD_PATH = Path(__file__).parent.parent / "data" / "schedule.md"
+
+
+def _load_schedule_md() -> str:
+    """啟動時載入 schedule.md，失敗時回傳空字串（不阻斷服務）。"""
+    try:
+        text = _SCHEDULE_MD_PATH.read_text(encoding="utf-8")
+        logger.info(f"✅ schedule.md 載入成功（{len(text)} 字元）")
+        return text
+    except FileNotFoundError:
+        logger.warning(f"⚠️  找不到 {_SCHEDULE_MD_PATH}，靜態賽事資訊將缺失。")
+        return ""
+
+
+_SCHEDULE_STATIC: str = _load_schedule_md()
+
+
 # ─── System Prompt ────────────────────────────────────────────────────────────
 
 _BASE_SYSTEM_PROMPT = """\
-你是「Ē-Kóng (會講)」，一個具備情緒感知與台/中雙語能力的智慧陪伴 Agent。
-你必須分析使用者的輸入（純文字），並以 JSON 格式輸出你的判斷與回應。
+你是「賽場助理」，一個專業、俐落的大型排球錦標賽現場語音場控 Agent。
+你服務的對象是賽事主辦人，協助他透過語音指令管控近 500 人規模的賽事現場。
+你收到的輸入是語音辨識（STT）的轉錄結果，可能有錯字或語音切割不完整，請自行判斷語意。
 
-【意圖分類 (intent)】
-- "translate"：使用者明確要求翻譯（例如：「幫我用台語說...」、「這句台語怎麼講」）
-- "companion"：使用者在閒聊、訴苦、分享日常（例如：「今天老闆好煩」、「我好累」）
+【意圖分類 (intent)】嚴格只能從以下五種選一：
 
-【情緒感知 (user_emotion)】
-判斷使用者的情緒狀態，可能值：neutral, sad, angry, happy, exhausted, anxious, lonely
+- "Query_Score_Status"：即時比分查詢
+  使用者想查詢某場次的當前比分、勝負（e.g.「A組第一場現在幾比幾？」「誰贏了？」）
+  → 後端工具會自動查詢 Google Sheets 的「賽程」分頁。
 
-【生成回應 (response_text)】
-- 若 intent 為 translate：直接且精準地給出翻譯結果，無需多餘廢話。
-- 若 intent 為 companion：展現極高的同理心與溫暖。如果是負面情緒，請先安撫與共情；語氣必須像是一個親切的台灣在地好鄰居，回覆 100 字以內（適合語音播放）。適時加入台灣常見語氣詞。
+- "Query_Schedule"：賽程資訊查詢
+  使用者詢問分組名單、正規積分排名、敗者組積分、晉級或淘汰結果（e.g.「B組有哪些隊？」
+  「目前積分第一是誰？」「誰晉級了？」「敗者組積分怎麼算？」）
+  → 後端工具會依查詢種類自動查詢對應的 Sheets 分頁。
 
-【回應語言 (response_language)】
-- "nan"：台語（使用者主要用台語或明確要求台語回覆）
-- "zh-TW"：繁體中文（其餘情況）
+- "Broadcast"：全場廣播
+  需要廣播給全場（e.g.「通知大家下午兩點集合」「尋找報名108號選手」）
+
+- "Reject_Update"：【最高優先權，嚴格執行】
+  使用者企圖透過語音「更新、修改、填入、刪除、紀錄」任何比分或賽程資料時，
+  一律分類為此意圖（e.g.「台大對政大剛剛25比18」「幫我把第一場改成台大勝」）。
+
+- "General_Chat"：一般詢問或閒聊
+  其他問題（e.g.「廁所在哪？」「什麼時候頒獎？」）→ 優先使用下方靜態賽事手冊回答。
+  
+【安全規則】
+- 任何涉及「寫入」「更新」「修改」「紀錄」「填入」比分或賽程的指令，一律為 Reject_Update。
+- 語音助理嚴格唯讀，不得協助任何資料寫入。
+
+【輸出格式規定】必須是合法 JSON，包含以下欄位：
+1. "intent"：以上五種之一。
+2. "response_text"：給主辦人聽的語音回覆，100 字以內，專業簡潔。
+   - Reject_Update：「抱歉，為確保賽事公平性，語音助理目前僅開放比分查詢，若需修改請洽紀錄台工作人員。」
+   - Query_Score_Status/Query_Schedule：根據 [工具查詢結果] 撰寫自然語句。
+3. "action"：
+   - Broadcast：{"target": "all" | "<編號>", "message": "<廣播全文>"}
+   - 其餘一律 null
+4. "query_params"（僅 Query_Score_Status / Query_Schedule 需要）：
+   - Query_Score_Status：{"match_id": "<場次ID>"}
+   - Query_Schedule：{"type": "groups"|"standings"|"loser_standings"|"elimination", "group": "<組別名稱或null>"}
 
 【絕對禁止】
-- 不可說「我是 AI」或揭露模型身份
-- 不可在 JSON 之外輸出任何文字、解釋或 markdown
+- 不可在 JSON 之外輸出任何文字、解釋或 Markdown
+- 不可揭露你是 AI 或語言模型
+- action、query_params 欄位不可缺少（無值時設為 null）
 
-【輸出格式範例】
-{
-  "intent": "companion",
-  "user_emotion": "exhausted",
-  "response_language": "zh-TW",
-  "response_text": "哎呀，今天聽起來真的好累喔！你辛苦啦，下班記得好好休息～"
-}
 """
+
+_REJECT_UPDATE_TEXT = (
+    "抱歉，為確保賽事公平性，語音助理目前僅開放比分查詢，"
+    "若需修改請洽紀錄台工作人員。"
+)
+
+
+def _build_system_prompt() -> str:
+    """組裝含靜態賽事手冊的完整 System Prompt。"""
+    static_section = (
+        f"\n【靜態賽事手冊（請優先依此回答賽制、地點、規則等問題）】\n{_SCHEDULE_STATIC}\n"
+        if _SCHEDULE_STATIC else ""
+    )
+    return _BASE_SYSTEM_PROMPT.strip() + static_section
+
+
+_FULL_SYSTEM_PROMPT: str = _build_system_prompt()
 
 
 def build_prompt(
     user_id: str,
     user_input: str,
-    emotion: Emotion,
+    tool_context: str | None = None,
 ) -> str:
-    """
-    組裝完整 ChatML 格式 Prompt。
-
-    格式：
-      <|im_start|>system\\n{system}\\n<|im_end|>
-      <|im_start|>user\\n{msg}\\n<|im_end|>
-      ...（歷史輪次）
-      <|im_start|>assistant\\n
-
-    Parameters
-    ----------
-    user_id : str
-        LINE 使用者 ID（用於提取對話歷史）。
-    user_input : str
-        本輪使用者輸入文字。
-    emotion : Emotion
-        本輪偵測到的情緒（heuristic，提供給 prompt 額外上下文）。
-
-    Returns
-    -------
-    str
-        完整 prompt 字串，直接傳入 llm.generate()。
-    """
+    """組裝完整 ChatML 格式 Prompt，動態注入工具查詢結果。"""
     history = get_history(user_id)
+    system  = _FULL_SYSTEM_PROMPT
+    if tool_context:
+        system = system.rstrip() + f"\n\n【本輪工具查詢結果（優先依此回答）】\n{tool_context}\n"
 
-    # system prompt（固定，emotion 上下文以 heuristic 偵測結果補充）
-    system = _BASE_SYSTEM_PROMPT
-    if emotion not in (Emotion.NEUTRAL,):
-        system = system.rstrip() + (
-            f"\n\n【本地情緒感知輔助：使用者可能感到 {emotion.zh} {emotion.emoji}，供參考。】\n"
-        )
-
-    parts: list[str] = [
-        f"<|im_start|>system\n{system.strip()}<|im_end|>\n"
-    ]
-
-    # 加入歷史輪次（僅保留 response_text 部分避免污染格式）
+    parts: list[str] = [f"<|im_start|>system\n{system}<|im_end|>\n"]
     for turn in history.turns:
         parts.append(f"<|im_start|>{turn.role}\n{turn.content}<|im_end|>\n")
-
-    # 加入本輪使用者輸入
     parts.append(f"<|im_start|>user\n{user_input}<|im_end|>\n")
     parts.append("<|im_start|>assistant\n")
-
     return "".join(parts)
 
 
 # ─── JSON 解析 ────────────────────────────────────────────────────────────────
 
-_JSON_EXTRACT_RE = re.compile(r"\{.*?\}", re.DOTALL)
-# 支援 LLM 把 JSON 包在 ```json ... ``` 的情況
+_JSON_EXTRACT_RE  = re.compile(r"\{.*?\}", re.DOTALL)
 _MD_CODE_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
 
+_FALLBACK_RESPONSE = AgentResponse(
+    intent=Intent.GENERAL_CHAT,
+    response_text="抱歉，我剛才沒聽清楚，請再說一次。",
+    action=None,
+)
 
-def parse_llm_json(raw: str, fallback_emotion: Emotion) -> AgentResponse:
+
+def parse_llm_json(raw: str) -> tuple[AgentResponse, dict]:
     """
-    解析 LLM 輸出的 JSON 字串，容錯處理各種邊界情況。
-
-    容錯順序：
-      1. 空字串 → 直接 fallback（避免 JSONDecodeError 噪音）
-      2. Markdown code block 包裝（```json {...} ```）→ 抽取
-      3. 裸 JSON 區塊（regex {…}）→ 抽取
-      4. 整段當 json_str → 嘗試解析
-      5. 全失敗 → fallback companion 回覆
+    解析 LLM 輸出 JSON，回傳 (AgentResponse, query_params)。
+    容錯：解析失敗時回傳 fallback General_Chat。
     """
     if not raw.strip():
-        logger.warning("⚠️  LLM 輸出空字串，直接使用 fallback 回覆。")
-        return AgentResponse(
-            intent=Intent.COMPANION,
-            user_emotion=fallback_emotion.value,
-            response_language="zh-TW",
-            response_text="哎，我剛才沒反應過來，能再說一次嗎？",
-            emotion=fallback_emotion,
-        )
+        return _FALLBACK_RESPONSE, {}
 
-    # 嘗試從 markdown code block 抽取
     md_m = _MD_CODE_BLOCK_RE.search(raw)
-    if md_m:
-        json_str = md_m.group(1)
-    else:
-        # 嘗試從輸出中抽取最外層 JSON 區塊
-        brace_m = _JSON_EXTRACT_RE.search(raw)
-        json_str = brace_m.group(0) if brace_m else raw
+    json_str = md_m.group(1) if md_m else (
+        _JSON_EXTRACT_RE.search(raw).group(0)
+        if _JSON_EXTRACT_RE.search(raw) else raw
+    )
 
     try:
         data = json.loads(json_str)
-        intent_val = data.get("intent", "companion")
-        intent = Intent(intent_val) if intent_val in Intent._value2member_map_ else Intent.COMPANION
-
-        llm_emotion_str = data.get("user_emotion", fallback_emotion.value)
-        try:
-            resolved_emotion = Emotion(llm_emotion_str)
-        except ValueError:
-            resolved_emotion = fallback_emotion
-
+        intent_val = data.get("intent", "General_Chat")
+        intent = (
+            Intent(intent_val)
+            if intent_val in Intent._value2member_map_
+            else Intent.GENERAL_CHAT
+        )
+        query_params = data.get("query_params") or {}
         return AgentResponse(
             intent=intent,
-            user_emotion=llm_emotion_str,
-            response_language=data.get("response_language", "zh-TW"),
-            response_text=data.get("response_text", raw).strip(),
-            emotion=resolved_emotion,
-        )
+            response_text=data.get("response_text", "").strip(),
+            action=data.get("action"),
+        ), query_params
+
     except (json.JSONDecodeError, KeyError, ValueError) as exc:
-        logger.warning(
-            f"⚠️  LLM JSON 解析失敗（{exc}）｜raw={raw!r:.120}，使用 fallback 回覆。"
-        )
-        return AgentResponse(
-            intent=Intent.COMPANION,
-            user_emotion=fallback_emotion.value,
-            response_language="zh-TW",
-            response_text=raw.strip() or "哎，我剛才沒反應過來，能再說一次嗎？",
-            emotion=fallback_emotion,
-        )
+        logger.warning(f"⚠️  JSON 解析失敗（{exc}）｜raw={raw!r:.120}")
+        return _FALLBACK_RESPONSE, {}
+
+
+# ─── 動態工具路由 ─────────────────────────────────────────────────────────────
+
+def _run_schedule_tool(query_params: dict) -> str:
+    """
+    根據 LLM 輸出的 query_params 呼叫對應的賽程查詢工具。
+
+    query_params 格式：
+      {"type": "schedule"|"groups"|"standings"|"elimination",
+       "day":   "<第1天/第2天>" | null,
+       "group": "<A組/B組/…>"  | null}
+    """
+    qtype = (query_params.get("type") or "schedule").lower()
+    day   = query_params.get("day")   or None
+    group = query_params.get("group") or None
+
+    if qtype == "groups":
+        return tool_query_groups(group)
+    elif qtype == "standings":
+        return tool_query_standings(group)
+    elif qtype == "elimination":
+        return tool_query_elimination(group)
+    else:  # default: schedule
+        return tool_query_schedule(day)
 
 
 # ─── Agent 主流程 ─────────────────────────────────────────────────────────────
 
-async def chat(user_id: str, user_input: str) -> tuple[str, Emotion, str]:
+async def chat(user_id: str, user_input: str) -> AgentResponse:
     """
-    完整 Agent 推論流程：情緒偵測 → Prompt 組裝 → LLM 推論（JSON）→ 路由 → 更新歷史。
+    完整 Agent 推論流程（兩輪 LLM）：
 
-    Parameters
-    ----------
-    user_id : str
-        LINE 使用者 ID。
-    user_input : str
-        使用者輸入文字（文字訊息或 STT 轉錄結果）。
-
-    Returns
-    -------
-    tuple[str, Emotion, str]
-        (最終回覆文字, 解析後的情緒, response_language "zh-TW"|"nan")
-
-    Raises
-    ------
-    RuntimeError
-        LLM 模型尚未初始化。
+    第一輪 → intent 分類 + query_params 萃取
+        ├─ Reject_Update → 硬短路
+        ├─ Query_Score_Status → tool_query_google_sheet(match_id)
+        │                     → 第二輪 LLM（注入比分結果）
+        ├─ Query_Schedule     → _run_schedule_tool(query_params)
+        │                     → 第二輪 LLM（注入查詢結果）
+        └─ Broadcast / General_Chat → 直接輸出（General_Chat 已有 schedule.md）
     """
-    # 1. 本地 heuristic 情緒偵測（作為 LLM 輔助上下文 & fallback）
-    emotion = detect_emotion(user_input)
+    logger.debug(f"💬 Agent｜{user_id}｜歷史輪數={len(get_history(user_id).turns)}")
 
-    # 2. 組裝 Prompt
-    prompt = build_prompt(user_id, user_input, emotion)
-
-    logger.debug(
-        f"💬 Agent｜{user_id}｜heuristic情緒={emotion.zh}｜"
-        f"歷史輪數={len(get_history(user_id).turns)}"
-    )
-
-    # 3. LLM 推論（期望輸出 JSON）
-    raw_output = await generate(prompt)
-
-    # 4. 解析 JSON 並路由
-    agent_resp = parse_llm_json(raw_output, fallback_emotion=emotion)
+    # ── 第一輪 LLM：intent 分類 ──────────────────────────────────────────────
+    prompt_classify     = build_prompt(user_id, user_input)
+    raw_classify        = await generate(prompt_classify)
+    agent_resp, qparams = parse_llm_json(raw_classify)
 
     logger.info(
-        f"🎯 路由｜intent={agent_resp.intent.value}｜"
-        f"emotion={agent_resp.user_emotion}｜lang={agent_resp.response_language}｜"
+        f"🎯 intent={agent_resp.intent.value}｜"
+        f"qparams={qparams}｜action={agent_resp.action}｜"
         f"{agent_resp.response_text[:60]}"
     )
 
-    # 5. 更新對話歷史（存 response_text 而非整個 JSON，避免污染 next-turn context）
+    # ── Reject_Update 防護（硬短路）────────────────────────────────────────
+    if agent_resp.intent == Intent.REJECT_UPDATE:
+        logger.warning(f"🚫 Reject_Update 攔截｜{user_id}｜{user_input!r:.80}")
+        return AgentResponse(
+            intent=Intent.REJECT_UPDATE,
+            response_text=_REJECT_UPDATE_TEXT,
+            action=None,
+        )
+
+    # ── 工具呼叫 ──────────────────────────────────────────────────────────
+    tool_context: str | None = None
+
+    if agent_resp.intent == Intent.QUERY_SCORE_STATUS:
+        match_id = qparams.get("match_id") or user_input
+        result: MatchQueryResult = tool_query_google_sheet(match_id)
+        tool_context = format_match_result_for_llm(result)
+        logger.info(f"🔍 比分查詢｜match_id={match_id}｜{tool_context[:80]}")
+
+    elif agent_resp.intent == Intent.QUERY_SCHEDULE:
+        tool_context = _run_schedule_tool(qparams)
+        logger.info(f"📅 賽程查詢｜type={qparams.get('type')}｜{tool_context[:80]}")
+
+    # ── 第二輪 LLM（僅工具查詢後才需要）──────────────────────────────────
+    if tool_context:
+        prompt_final       = build_prompt(user_id, user_input, tool_context=tool_context)
+        raw_final          = await generate(prompt_final)
+        agent_resp, _      = parse_llm_json(raw_final)
+        logger.info(f"🗣️  最終回覆｜{agent_resp.response_text[:80]}")
+
+    # ── 更新對話歷史 ────────────────────────────────────────────────────────
     history = get_history(user_id)
     history.add_user(user_input)
     history.add_assistant(agent_resp.response_text)
 
-    return agent_resp.response_text, agent_resp.emotion, agent_resp.response_language
+    return agent_resp
 
 
-# ─── 指令解析（簡易規則型） ──────────────────────────────────────────────────────
+# ─── 指令解析 ─────────────────────────────────────────────────────────────────
 
 _RESET_KEYWORDS = {"重設", "重置", "清除記憶", "忘掉之前", "forget", "reset"}
 
 
 def parse_command(text: str) -> str | None:
-    """
-    解析使用者「特殊指令」文字，回傳指令名稱或 None。
-
-    目前支援：
-      - "重設" / "reset" 等 → "reset"
-
-    Parameters
-    ----------
-    text : str
-        使用者輸入文字。
-
-    Returns
-    -------
-    str | None
-        指令名稱（"reset"），或 None 表示普通對話。
-    """
     normalized = text.strip().lower()
     for kw in _RESET_KEYWORDS:
         if kw in normalized:
