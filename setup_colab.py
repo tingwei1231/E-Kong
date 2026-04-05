@@ -38,9 +38,8 @@ LINE_CHANNEL_ACCESS_TOKEN: str = os.environ["LINE_CHANNEL_ACCESS_TOKEN"]
 APP_PORT: int = int(os.getenv("APP_PORT", "8000"))
 LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
-# llama-cpp-python 版本（CUDA wheel 透過 --extra-index-url 安裝）
+# llama-cpp-python 版本（透過原始碼編譯安裝以支援最新 Colab CUDA 環境）
 LLAMA_CPP_VERSION = "0.2.90"  # 鎖版本確保可重現，可視需求升級
-LLAMA_CPP_INDEX_URL = "https://abetlen.github.io/llama-cpp-python/whl/cu121"  # CUDA 12.x
 
 # ─── Logger ────────────────────────────────────────────────────────────────────
 logger.remove()
@@ -93,15 +92,20 @@ def install_requirements() -> None:
         "-q", "-r", str(req_path),
     ])
 
-    logger.info(f"⚡ 安裝 CUDA 版 llama-cpp-python=={LLAMA_CPP_VERSION}...")
+    logger.info(f"⚡ 從原始碼編譯安裝 CUDA 版 llama-cpp-python=={LLAMA_CPP_VERSION} (這可能需要 2-3 分鐘)...")
+    env = os.environ.copy()
+    env["CMAKE_ARGS"] = "-DGGML_CUDA=on"
+    env["FORCE_CMAKE"] = "1"
+    
     subprocess.check_call([
         sys.executable, "-m", "pip", "install",
         "-q",
+        "--upgrade",
         "--force-reinstall",
-        "--no-deps",                       # 不重裝已有的依賴，加速安裝
+        "--no-cache-dir",
+        "--no-deps",
         f"llama-cpp-python=={LLAMA_CPP_VERSION}",
-        "--extra-index-url", LLAMA_CPP_INDEX_URL,
-    ])
+    ], env=env)
     logger.success("✅ 所有依賴安裝完成。")
 
 
