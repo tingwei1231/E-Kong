@@ -12,7 +12,7 @@ pyngrok==7.1.6
 
 # ── STT: faster-whisper (INT8 量化) ──────────────────────────────────────────
 faster-whisper==1.0.3
-ctranslate2==4.1.0
+ctranslate2==4.4.0
 
 # ── LLM: llama-cpp-python (GGUF 4-bit, CUDA offload) ────────────────────────
 # setup_colab.py 會以 --extra-index-url 覆蓋安裝 CUDA 預編譯版本
