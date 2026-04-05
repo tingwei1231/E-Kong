@@ -5,7 +5,7 @@ tests/test_pipeline.py — 端對端 Pipeline 整合測試
 
 測試策略：
   - 所有外部依賴（LINE API、Whisper、LLM、TTS）均以 Mock 替換
-  - 測試業務邏輯正確性（路由、情緒偵測、Prompt 組裝、Fallback 機制）
+  - 測試業務邏輯正確性（intent 路由、Prompt 組裝、JSON 解析、Fallback 機制）
   - 不需 GPU / 模型檔案即可在本機執行
 
 執行：
@@ -19,6 +19,7 @@ tests/test_pipeline.py — 端對端 Pipeline 整合測試
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -53,36 +54,73 @@ def mock_settings():
         yield fake
 
 
-# ─── 情緒偵測測試 ─────────────────────────────────────────────────────────────
+# ─── JSON 解析測試 ────────────────────────────────────────────────────────────
 
-class TestEmotionDetection:
-    """測試 detect_emotion() 的關鍵詞命中邏輯。"""
+class TestParseJson:
+    """測試 parse_llm_json() 的正確性與容錯能力。"""
 
-    def test_happy_keywords(self):
-        from app.services.agent import Emotion, detect_emotion
-        assert detect_emotion("今天好開心！哈哈") == Emotion.HAPPY
+    def test_update_score_intent(self):
+        from app.services.agent import Intent, parse_llm_json
+        raw = json.dumps({
+            "intent": "Update_Score",
+            "response_text": "已更新比分。",
+            "action": {"match_id": "A組第一場", "team_a": "台大", "score_a": 25,
+                       "team_b": "政大", "score_b": 18, "winner": "台大"},
+        })
+        resp = parse_llm_json(raw)
+        assert resp.intent == Intent.UPDATE_SCORE
+        assert resp.response_text == "已更新比分。"
+        assert resp.action["winner"] == "台大"
 
-    def test_sad_keywords(self):
-        from app.services.agent import Emotion, detect_emotion
-        assert detect_emotion("我好難過，傷心死了") == Emotion.SAD
+    def test_broadcast_intent(self):
+        from app.services.agent import Intent, parse_llm_json
+        raw = json.dumps({
+            "intent": "Broadcast",
+            "response_text": "廣播已送出。",
+            "action": {"target": "all", "message": "請裁判到主場地集合。"},
+        })
+        resp = parse_llm_json(raw)
+        assert resp.intent == Intent.BROADCAST
+        assert resp.action["target"] == "all"
 
-    def test_anxious_keywords(self):
-        from app.services.agent import Emotion, detect_emotion
-        assert detect_emotion("好擔心喔，怎麼辦") == Emotion.ANXIOUS
+    def test_general_chat_action_is_none(self):
+        from app.services.agent import Intent, parse_llm_json
+        raw = json.dumps({
+            "intent": "General_Chat",
+            "response_text": "決賽在三點開始。",
+            "action": None,
+        })
+        resp = parse_llm_json(raw)
+        assert resp.intent == Intent.GENERAL_CHAT
+        assert resp.action is None
 
-    def test_multiple_exclamation_anxious(self):
-        from app.services.agent import Emotion, detect_emotion
-        # 多個問號 → 焦慮
-        result = detect_emotion("怎麼辦！！！")
-        assert result == Emotion.ANXIOUS
+    def test_unknown_intent_fallback_to_general_chat(self):
+        from app.services.agent import Intent, parse_llm_json
+        raw = json.dumps({
+            "intent": "random_unknown",
+            "response_text": "??",
+            "action": None,
+        })
+        resp = parse_llm_json(raw)
+        assert resp.intent == Intent.GENERAL_CHAT
 
-    def test_neutral_no_keywords(self):
-        from app.services.agent import Emotion, detect_emotion
-        assert detect_emotion("今天天氣不錯") == Emotion.NEUTRAL
+    def test_empty_string_fallback(self):
+        from app.services.agent import Intent, parse_llm_json
+        resp = parse_llm_json("")
+        assert resp.intent == Intent.GENERAL_CHAT
+        assert resp.action is None
 
-    def test_angry_emoji(self):
-        from app.services.agent import Emotion, detect_emotion
-        assert detect_emotion("真的很煩😤") == Emotion.ANGRY
+    def test_markdown_code_block_extracted(self):
+        from app.services.agent import Intent, parse_llm_json
+        raw = '```json\n{"intent": "General_Chat", "response_text": "好的。", "action": null}\n```'
+        resp = parse_llm_json(raw)
+        assert resp.intent == Intent.GENERAL_CHAT
+        assert resp.response_text == "好的。"
+
+    def test_malformed_json_fallback(self):
+        from app.services.agent import Intent, parse_llm_json
+        resp = parse_llm_json("這不是 JSON 格式的東西")
+        assert resp.intent == Intent.GENERAL_CHAT
 
 
 # ─── Prompt 組裝測試 ──────────────────────────────────────────────────────────
@@ -91,35 +129,30 @@ class TestPromptBuilding:
     """測試 build_prompt() 格式與內容。"""
 
     def test_chatml_format(self):
-        from app.services.agent import Emotion, build_prompt
-        prompt = build_prompt("user_123", "你好", Emotion.NEUTRAL)
+        from app.services.agent import build_prompt
+        prompt = build_prompt("user_123", "比賽幾點開始？")
         assert "<|im_start|>system" in prompt
         assert "<|im_start|>user" in prompt
         assert "<|im_start|>assistant" in prompt
-        assert "你好" in prompt
-
-    def test_emotion_context_injected_when_non_neutral(self):
-        from app.services.agent import Emotion, build_prompt
-        prompt = build_prompt("user_123", "我好難過", Emotion.SAD)
-        assert "難過" in prompt      # 情緒上下文被注入
-        assert "😢" in prompt
-
-    def test_emotion_context_absent_when_neutral(self):
-        from app.services.agent import Emotion, build_prompt
-        prompt = build_prompt("user_123", "你好", Emotion.NEUTRAL)
-        # NEUTRAL 不注入情緒上下文
-        assert "當前情緒感知" not in prompt
+        assert "比賽幾點開始？" in prompt
 
     def test_history_included_in_prompt(self):
-        from app.services.agent import Emotion, build_prompt, get_history
+        from app.services.agent import build_prompt, get_history
         history = get_history("user_hist_test")
         history.add_user("第一輪問題")
         history.add_assistant("第一輪回答")
 
-        prompt = build_prompt("user_hist_test", "第二輪問題", Emotion.NEUTRAL)
+        prompt = build_prompt("user_hist_test", "第二輪問題")
         assert "第一輪問題" in prompt
         assert "第一輪回答" in prompt
         assert "第二輪問題" in prompt
+
+    def test_system_prompt_contains_intents(self):
+        from app.services.agent import build_prompt
+        prompt = build_prompt("user_sys", "test")
+        assert "Update_Score" in prompt
+        assert "Broadcast" in prompt
+        assert "General_Chat" in prompt
 
 
 # ─── 對話歷史測試 ─────────────────────────────────────────────────────────────
@@ -140,7 +173,6 @@ class TestConversationHistory:
         h.turns = __import__("collections").deque(maxlen=4)
         for i in range(10):
             h.add_user(f"msg{i}")
-        # 超過 maxlen 後自動丟棄最舊
         assert len(h.turns) == 4
         assert h.turns[-1].content == "msg9"
 
@@ -189,7 +221,6 @@ class TestRomanizedDetection:
 
     def test_mixed_mostly_latin_is_romanized(self):
         from app.models.tts_tw import is_romanized
-        # 漢字少於 20%
         assert is_romanized("li ho a") is True
 
 
@@ -200,7 +231,6 @@ class TestAudioService:
 
     def test_cleanup_nonexistent_file_no_crash(self):
         from app.services.audio import cleanup_temp_file
-        # 應不拋例外
         cleanup_temp_file("/tmp/nonexistent_ekong_test.wav")
 
     @pytest.mark.asyncio
@@ -235,24 +265,51 @@ class TestAgentChatFlow:
     async def test_chat_updates_history(self):
         from app.services.agent import chat, get_history
 
-        with patch("app.services.agent.generate", new=AsyncMock(return_value="你好！有什麼可以幫你的？")):
-            reply, emotion = await chat("e2e_test_user", "你好")
+        llm_output = json.dumps({
+            "intent": "General_Chat",
+            "response_text": "決賽在三點開始，請準時入場。",
+            "action": None,
+        })
+        with patch("app.services.agent.generate", new=AsyncMock(return_value=llm_output)):
+            resp = await chat("e2e_test_user", "決賽幾點？")
 
-        assert reply == "你好！有什麼可以幫你的？"
+        assert resp.response_text == "決賽在三點開始，請準時入場。"
         history = get_history("e2e_test_user")
-        # 歷史應更新
         turns = list(history.turns)
-        assert any(t.content == "你好" for t in turns)
-        assert any(t.content == "你好！有什麼可以幫你的？" for t in turns)
+        assert any(t.content == "決賽幾點？" for t in turns)
+        assert any(t.content == "決賽在三點開始，請準時入場。" for t in turns)
 
     @pytest.mark.asyncio
-    async def test_chat_detects_emotion(self):
-        from app.services.agent import Emotion, chat
+    async def test_chat_update_score_intent(self):
+        from app.services.agent import Intent, chat
 
-        with patch("app.services.agent.generate", new=AsyncMock(return_value="我懂你的感受...")):
-            _, emotion = await chat("emotion_test_user", "我好難過，心情很差😢")
+        llm_output = json.dumps({
+            "intent": "Update_Score",
+            "response_text": "已更新台大對政大，台大 25:18 獲勝。",
+            "action": {"match_id": "A組第一場", "team_a": "台大", "score_a": 25,
+                       "team_b": "政大", "score_b": 18, "winner": "台大"},
+        })
+        with patch("app.services.agent.generate", new=AsyncMock(return_value=llm_output)):
+            resp = await chat("score_test_user", "A組第一場台大對政大25比18台大勝")
 
-        assert emotion == Emotion.SAD
+        assert resp.intent == Intent.UPDATE_SCORE
+        assert resp.action is not None
+        assert resp.action["winner"] == "台大"
+
+    @pytest.mark.asyncio
+    async def test_chat_broadcast_intent(self):
+        from app.services.agent import Intent, chat
+
+        llm_output = json.dumps({
+            "intent": "Broadcast",
+            "response_text": "廣播已送出。",
+            "action": {"target": "all", "message": "請裁判到主場地集合。"},
+        })
+        with patch("app.services.agent.generate", new=AsyncMock(return_value=llm_output)):
+            resp = await chat("broadcast_test_user", "廣播請裁判到主場地集合")
+
+        assert resp.intent == Intent.BROADCAST
+        assert resp.action["target"] == "all"
 
     @pytest.mark.asyncio
     async def test_try_reply_audio_returns_false_when_no_tts(self):
