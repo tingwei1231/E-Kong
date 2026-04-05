@@ -40,7 +40,7 @@ LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
 
 # llama-cpp-python 版本 (針對 Colab CUDA 12.2+ 與 Python 3.12)
 LLAMA_CPP_VERSION = "0.3.5"
-LLAMA_CPP_INDEX_URL = "https://abetlen.github.io/llama-cpp-python/whl/cu124"
+LLAMA_CPP_INDEX_URL = "https://abetlen.github.io/llama-cpp-python/whl/cu122"
 
 # ─── Logger ────────────────────────────────────────────────────────────────────
 logger.remove()
