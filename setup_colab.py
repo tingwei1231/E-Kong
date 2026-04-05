@@ -212,12 +212,6 @@ def start_server(port: int) -> subprocess.Popen:
     except Exception as e:
         logger.debug(f"清理舊 uvicorn 時略過：{e}")
 
-    # 針對 Colab，強制注入 CUDA 函式庫路徑，避免 libcudart.so.12 找不到
-    cuda_path = "/usr/local/cuda/lib64"
-    current_ld = os.environ.get("LD_LIBRARY_PATH", "")
-    if cuda_path not in current_ld:
-        os.environ["LD_LIBRARY_PATH"] = f"{cuda_path}:{current_ld}" if current_ld else cuda_path
-        
     cmd = [
         sys.executable, "-m", "uvicorn",
         "app.main:app",
