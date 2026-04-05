@@ -73,7 +73,7 @@ def mount_google_drive() -> None:
         logger.success("✅ Google Drive 已掛載至 /content/drive")
         
         # 掛載成功後，統一將模型快取路徑指向 Drive，避免每次重啟重新下載
-        hf_cache_dir = "/content/drive/MyDrive/EKong_Models"
+        hf_cache_dir = "/content/drive/MyDrive/ekong_models"
         os.makedirs(hf_cache_dir, exist_ok=True)
         os.environ["HF_HOME"] = hf_cache_dir
         logger.success(f"📂 模型快取路徑已切換至：{hf_cache_dir}")

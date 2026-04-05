@@ -47,7 +47,7 @@ class Settings(BaseSettings):
 
     # ── Whisper STT ───────────────────────────────────────────────────────────
     whisper_model_size: Literal["tiny", "base", "small", "medium", "large-v3"] = "base"
-    whisper_device: Literal["cpu", "cuda"] = "cuda"
+    whisper_device: Literal["cpu", "cuda"] = "cpu"
     whisper_compute_type: Literal["int8", "float16", "float32"] = "int8"
 
     @field_validator("llm_temperature")
