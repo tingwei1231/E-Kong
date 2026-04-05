@@ -189,11 +189,10 @@ async def generate(
     if not text:
         logger.warning(
             f"⚠️  LLM 輸出空字串｜finish={finish_reason}｜"
-            f"raw={output['choices'][0]['text']!r}"
+            f"raw={output['text']!r}"
         )
     else:
         logger.debug(
-            f"🤖 LLM 生成｜tokens={output['usage']['completion_tokens']}｜"
-            f"finish={finish_reason}｜{repr(text[:80])}"
+            f"🤖 LLM 生成完成｜finish={finish_reason}｜{repr(text[:80])}"
         )
     return text
