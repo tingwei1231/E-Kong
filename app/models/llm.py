@@ -153,7 +153,8 @@ async def _generate_gemini(
         logger.error("❌ llm_provider 設為 gemini 但未提供 GOOGLE_API_KEY！")
         return "⚠️ [系統錯誤] LLM API 金鑰未設定。"
 
-    url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-1.5-flash:generateContent?key={settings.google_api_key}"
+    url = "https://generativelanguage.googleapis.com/v1/models/gemini-1.5-flash:generateContent"
+    params = {"key": settings.google_api_key}
     payload = {
         "contents": [{"parts": [{"text": prompt}]}],
         "generationConfig": {
@@ -166,7 +167,7 @@ async def _generate_gemini(
     logger.debug("🔵 Gemini API 呼叫中...")
     async with httpx.AsyncClient(timeout=60.0) as client:
         try:
-            resp = await client.post(url, json=payload)
+            resp = await client.post(url, params=params, json=payload)
             resp.raise_for_status()
             data = resp.json()
             text = data["candidates"][0]["content"]["parts"][0]["text"]
