@@ -135,23 +135,30 @@ async def generate(
     RuntimeError
         模型尚未初始化。
     """
+    logger.debug("進入 generate 函式，準備取得 LLM 實例...")
     model = get_llm()
     _max_tokens = max_tokens or settings.llm_max_tokens
     _temperature = temperature if temperature is not None else settings.llm_temperature
     _stop = stop or ["</s>", "<|im_end|>", "[/INST]", "User:", "使用者："]
 
     loop = asyncio.get_event_loop()
-    output = await loop.run_in_executor(
-        _executor,
-        lambda: model.create_completion(
+    logger.debug("準備排入 _executor 執行 llama.cpp 同步推論...")
+
+    def _sync_inference():
+        logger.debug("🚀 _executor 執行緒開始跑 model.create_completion...")
+        result = model.create_completion(
             prompt,
             max_tokens=_max_tokens,
             temperature=_temperature,
             stop=_stop,
             echo=False,         # 不回傳 prompt 本身
             stream=False,
-        ),
-    )
+        )
+        logger.debug("✅ model.create_completion 返回了！")
+        return result
+
+    output = await loop.run_in_executor(_executor, _sync_inference)
+    logger.debug("👉 等待 run_in_executor 完成...")
 
     text: str = output["choices"][0]["text"].strip()
     finish_reason: str = output["choices"][0]["finish_reason"]

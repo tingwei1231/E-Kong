@@ -309,8 +309,15 @@ async def chat(user_id: str, user_input: str) -> AgentResponse:
     logger.debug(f"💬 Agent｜{user_id}｜歷史輪數={len(get_history(user_id).turns)}")
 
     # ── 第一輪 LLM：intent 分類 ──────────────────────────────────────────────
+    logger.debug("開始組裝分類 Prompt...")
     prompt_classify     = build_prompt(user_id, user_input)
-    raw_classify        = await generate(prompt_classify)
+    logger.debug(f"分類 Prompt 組裝完成 (長度: {len(prompt_classify)})，準備呼叫 LLM...")
+    try:
+        raw_classify    = await generate(prompt_classify)
+        logger.debug(f"LLM 呼叫完成，取得字串長度: {len(raw_classify)}，準備解析 JSON...")
+    except Exception as e:
+        logger.error(f"❌ 呼叫 LLM 時發生錯誤：{e}")
+        raise
     agent_resp, qparams = parse_llm_json(raw_classify)
 
     logger.info(
