@@ -47,6 +47,22 @@ async def init_llm() -> None:
             return
 
         model_path = settings.llm_model_path
+        
+        import os
+        if not os.path.exists(model_path):
+            logger.warning(f"⚠️  找不到本地端模型：{model_path}")
+            logger.info("⏳ 系統將自動從 Hugging Face 下載並快取 Qwen2.5-7B 模型...")
+            try:
+                from huggingface_hub import hf_hub_download
+                model_path = hf_hub_download(
+                    repo_id="Qwen/Qwen2.5-7B-Instruct-GGUF",
+                    filename="qwen2.5-7b-instruct-q4_k_m.gguf"
+                )
+                logger.success(f"✅ 模型下載/暫存完成：{model_path}")
+            except Exception as e:
+                logger.error(f"❌ 自動下載模型失敗：{e}")
+                raise
+
         n_gpu = settings.llm_n_gpu_layers
 
         logger.info(
