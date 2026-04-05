@@ -38,7 +38,7 @@ class Settings(BaseSettings):
 
     # ── LLM (llama.cpp) ───────────────────────────────────────────────────────
     llm_model_path: str = Field(
-        default="/content/drive/MyDrive/ekong_models/qwen2.5-7b-instruct-q4_k_m-00001-of-00002.gguf",
+        default="qwen2.5-7b-instruct-q4_k_m.gguf",
         description="GGUF 模型絕對路徑",
     )
     llm_n_gpu_layers: int = Field(default=35, description="GPU offload 層數；-1 表示全量")
