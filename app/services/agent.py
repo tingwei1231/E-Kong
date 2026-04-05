@@ -241,16 +241,24 @@ def parse_llm_json(raw: str) -> tuple[AgentResponse, dict]:
 
     try:
         data = json.loads(json_str)
-        intent_val = data.get("intent", "General_Chat")
-        intent = (
-            Intent(intent_val)
-            if intent_val in Intent._value2member_map_
-            else Intent.GENERAL_CHAT
-        )
+        intent_val = str(data.get("intent", "General_Chat")).strip()
+        matched_intent = None
+        for member in Intent:
+            if member.value.lower() == intent_val.lower():
+                matched_intent = member
+                break
+        intent = matched_intent if matched_intent else Intent.GENERAL_CHAT
+
         query_params = data.get("query_params") or {}
+        response_text = (data.get("response_text") or "").strip()
+        
+        # 防止空字串導致 LINE API 回傳 400 錯誤
+        if not response_text:
+            response_text = "好的，馬上為您查詢。" if intent != Intent.GENERAL_CHAT else _FALLBACK_RESPONSE.response_text
+
         return AgentResponse(
             intent=intent,
-            response_text=data.get("response_text", "").strip(),
+            response_text=response_text,
             action=data.get("action"),
         ), query_params
 
