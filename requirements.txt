@@ -10,22 +10,19 @@ line-bot-sdk==3.11.0
 # ── Tunnel / ngrok ───────────────────────────────────────────────────────────
 pyngrok==7.1.6
 
-# ── STT: faster-whisper (INT8 量化) ──────────────────────────────────────────
-faster-whisper==1.0.3
-ctranslate2==4.4.0
+# ── STT: Groq Whisper API（取代本地 faster-whisper）─────────────────────────
+groq>=0.9.0
 
 # ── LLM: llama-cpp-python (GGUF 4-bit, CUDA offload) ────────────────────────
 # setup_colab.py 會以 --extra-index-url 覆蓋安裝 CUDA 預編譯版本
 # 本行僅作為 CPU fallback（本機開發 / CI 環境）
 llama-cpp-python==0.2.90
 
-# ── TTS: ChatTTS (中文) & MMS-TTS (台語) ────────────────────────────────────
-# ChatTTS pip 套件名稱（注意：不是 "ChatTTS==x.x.x"）
-chattts==0.1.1
-transformers==4.41.2
-# torch/torchaudio 在 Colab 環境已內建（CUDA 版），不在此處鎖版以避免衝突
-# 本機開發請手動: pip install torch torchaudio --index-url https://download.pytorch.org/whl/cu121
-soundfile==0.12.1
+# ── TTS 已移除（架構改為純文字輸出） ─────────────────────────────────────────
+# chattts, transformers, soundfile 已不再需要
+
+# ── ffmpeg 依賴（音訊轉換 m4a → WAV）────────────────────────────────────────
+# Colab 已預裝；本機需手動安裝 ffmpeg binary
 
 # ── Observability & Utilities ────────────────────────────────────────────────
 loguru==0.7.2

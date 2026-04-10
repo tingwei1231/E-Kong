@@ -1,39 +1,27 @@
 """
-app/services/agent.py — 排球錦標賽語音場控 Agent
-=================================================
-職責：
-  1. 載入 app/data/schedule.md（靜態賽事資訊，注入 System Prompt）
-  2. 對話歷史管理（In-memory，per-user，環形緩衝）
-  3. 系統 Prompt 組裝（靜態手冊 + JSON 格式指示）
-  4. 呼叫 llm.generate() 取得 JSON 回覆，並解析路由
-  5. 意圖防護：Reject_Update 攔截所有語音更新請求
+app/services/agent.py — 排球錦標賽場控 Agent（重構版）
+=====================================================
+架構重點（與舊版重大差異）：
+  1. 「光速 Regex 路由」取代第一輪 LLM：fast_intent_router()
+     - 毫秒級意圖分類，不消耗 GPU / API 配額
+  2. 單次 LLM 呼叫：build_final_prompt() 組裝完整 Context 後只打一次 Qwen
+  3. 純文字輸出：不再有 TTS、不再有 AudioSendMessage
+  4. Groq Whisper STT：語音辨識改由 Groq API 完成（見 line_handler.py）
 
-五種 Intent：
-  - Query_Score_Status：查詢即時比分（→ tool_query_google_sheet）
-  - Query_Schedule    ：查詢賽程/分組/積分/晉淘（→ tool_query_schedule 等）
-  - Broadcast         ：全場廣播
-  - Reject_Update     ：企圖更新比分 → 硬短路
-  - General_Chat      ：一般詢問（直接由 LLM + schedule.md 回答）
-
-Context 架構：
-  ┌─ System Prompt（固定）
-  │    ├─ 角色定義 + 五種 Intent 說明
-  │    └─ schedule.md 靜態全文（啟動時一次載入）
-  │
-  └─ Tool Context（動態，每輪請求按需查詢）
-       ├─ Query_Score_Status → 即時比分
-       └─ Query_Schedule     → 賽程/分組/積分/晉淘
+Intent 分類（Regex 決定）：
+  - Reject_Update      ：企圖修改比分 → 硬短路，不呼叫 LLM
+  - Broadcast          ：廣播請求
+  - Query_Score_Status ：即時比分查詢 → 呼叫 Google Sheets 工具
+  - Query_Schedule     ：規則/場地/賽制查詢 → 讀取靜態 schedule.md
+  - General_Chat       ：其餘 → 靜態手冊 + LLM 回答
 """
 
 from __future__ import annotations
 
-import json
 import re
-from collections import deque
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
-from typing import Deque
 
 from loguru import logger
 
@@ -52,11 +40,11 @@ from app.services.tools import (
 # ─── Intent 枚舉 ──────────────────────────────────────────────────────────────
 
 class Intent(str, Enum):
-    QUERY_SCORE_STATUS = "Query_Score_Status"  # 即時比分查詢（唯讀）
-    QUERY_SCHEDULE     = "Query_Schedule"       # 賽程/分組/積分/晉淘查詢
-    BROADCAST          = "Broadcast"            # 全場廣播
-    REJECT_UPDATE      = "Reject_Update"        # 企圖更新比分 → 攔截
-    GENERAL_CHAT       = "General_Chat"         # 一般詢問（用 schedule.md 回答）
+    REJECT_UPDATE      = "Reject_Update"       # 企圖更新比分 → 攔截
+    BROADCAST          = "Broadcast"           # 全場廣播
+    QUERY_SCORE_STATUS = "Query_Score_Status"  # 即時比分查詢
+    QUERY_SCHEDULE     = "Query_Schedule"      # 靜態賽事規則查詢
+    GENERAL_CHAT       = "General_Chat"        # 一般詢問
 
 
 # ─── Agent 回應結構 ────────────────────────────────────────────────────────────
@@ -68,45 +56,7 @@ class AgentResponse:
     action:        dict | None  # 僅 Broadcast 有值，其餘 None
 
 
-# ─── 對話歷史 ─────────────────────────────────────────────────────────────────
-
-@dataclass
-class Turn:
-    role: str
-    content: str
-
-
-@dataclass
-class ConversationHistory:
-    maxlen: int = 10
-    turns: Deque[Turn] = field(default_factory=lambda: deque(maxlen=10))
-
-    def add_user(self, text: str) -> None:
-        self.turns.append(Turn(role="user", content=text))
-
-    def add_assistant(self, text: str) -> None:
-        self.turns.append(Turn(role="assistant", content=text))
-
-    def clear(self) -> None:
-        self.turns.clear()
-
-
-_histories: dict[str, ConversationHistory] = {}
-
-
-def get_history(user_id: str) -> ConversationHistory:
-    if user_id not in _histories:
-        _histories[user_id] = ConversationHistory()
-    return _histories[user_id]
-
-
-def clear_history(user_id: str) -> None:
-    if user_id in _histories:
-        _histories[user_id].clear()
-        logger.info(f"🗑️  已清除 {user_id} 的對話歷史。")
-
-
-# ─── 靜態賽事手冊載入 ────────────────────────────────────────────────────────
+# ─── 靜態賽事手冊載入 ──────────────────────────────────────────────────────────
 
 _SCHEDULE_MD_PATH = Path(__file__).parent.parent / "data" / "schedule.md"
 
@@ -124,208 +74,179 @@ def _load_schedule_md() -> str:
 
 _SCHEDULE_STATIC: str = _load_schedule_md()
 
+# ─── 拒絕更新文字（硬短路，不過 LLM）────────────────────────────────────────
 
-# ─── System Prompt ────────────────────────────────────────────────────────────
+_REJECT_UPDATE_TEXT = (
+    "抱歉，語音助理目前僅供查詢，"
+    "若需修改比分請洽紀錄台工作人員。"
+)
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🚀 光速 Regex 路由
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# 各 Intent 的 Regex pattern（順序決定優先權：Reject 最高）
+_PATTERNS: list[tuple[Intent, re.Pattern[str]]] = [
+    (
+        Intent.REJECT_UPDATE,
+        re.compile(r"(改|修改|更新|刪除|填入|記錄|紀錄|寫入).{0,8}(比分|分數|賽程|場次|局數)", re.IGNORECASE),
+    ),
+    (
+        Intent.BROADCAST,
+        re.compile(r"廣播", re.IGNORECASE),
+    ),
+    (
+        Intent.QUERY_SCORE_STATUS,
+        re.compile(
+            r"(比分|幾比幾|幾局|幾分|比幾|分數|現在.*?(贏|輸|領先)|誰贏|誰輸|賽程|場次|結果|狀態|比賽)",
+            re.IGNORECASE,
+        ),
+    ),
+    (
+        Intent.QUERY_SCHEDULE,
+        re.compile(
+            r"(規則|網高|資格|報名|停車|場地|積分怎麼算|賽制|時間|幾點|幾號|分組|哪些隊|參賽隊|晉級|淘汰|幾隊)",
+            re.IGNORECASE,
+        ),
+    ),
+]
+
+
+def fast_intent_router(user_text: str) -> dict:
+    """
+    光速 Regex 意圖路由器。
+
+    Parameters
+    ----------
+    user_text : str
+        使用者輸入（STT 轉錄或直接文字）。
+
+    Returns
+    -------
+    dict
+        {"intent": Intent, "reject_msg": str | None}
+        reject_msg 僅在 Reject_Update 時有值，可直接回傳給使用者。
+    """
+    for intent, pattern in _PATTERNS:
+        if pattern.search(user_text):
+            logger.debug(f"🎯 Regex 路由命中 → {intent.value}（input: {user_text!r:.60}）")
+            if intent == Intent.REJECT_UPDATE:
+                return {"intent": intent, "reject_msg": _REJECT_UPDATE_TEXT}
+            return {"intent": intent, "reject_msg": None}
+
+    # 沒有任何 pattern 命中 → 一般詢問
+    logger.debug(f"🎯 Regex 路由 fallback → General_Chat（input: {user_text!r:.60}）")
+    return {"intent": Intent.GENERAL_CHAT, "reject_msg": None}
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+# 📝 Prompt 組裝
+# ═══════════════════════════════════════════════════════════════════════════════
 
 _BASE_SYSTEM_PROMPT = """\
-你是「賽場助理」，一個專業、俐落的大型排球錦標賽現場語音場控 Agent。
-你服務的對象是賽事主辦人，協助他透過語音指令管控近 500 人規模的賽事現場。
-你收到的輸入是語音辨識（STT）的轉錄結果，可能有錯字或語音切割不完整，請自行判斷語意。
+你是「賽場助理」，協助主辦人管控大型排球錦標賽現場（約 500 人規模）。
+你的輸入可能是語音辨識（STT）的轉錄結果，可能有錯字，請自行判斷語意。
 
-【意圖分類 (intent)】嚴格只能從以下五種選一：
-
-- "Query_Score_Status"：即時比分查詢
-  使用者想查詢某場次的當前比分、勝負（e.g.「A組第一場現在幾比幾？」「誰贏了？」）
-  → 後端工具會自動查詢 Google Sheets 的「賽程」分頁。
-
-- "Query_Schedule"：賽程資訊查詢
-  使用者詢問分組名單、正規積分排名、敗者組積分、晉級或淘汰結果（e.g.「B組有哪些隊？」
-  「目前積分第一是誰？」「誰晉級了？」「敗者組積分怎麼算？」）
-  → 後端工具會依查詢種類自動查詢對應的 Sheets 分頁。
-
-- "Broadcast"：全場廣播
-  需要廣播給全場（e.g.「通知大家下午兩點集合」「尋找報名108號選手」）
-
-- "Reject_Update"：【最高優先權，嚴格執行】
-  使用者企圖透過語音「更新、修改、填入、刪除、紀錄」任何比分或賽程資料時，
-  一律分類為此意圖（e.g.「台大對政大剛剛25比18」「幫我把第一場改成台大勝」）。
-
-- "General_Chat"：一般詢問或閒聊
-  其他問題（e.g.「廁所在哪？」「什麼時候頒獎？」）→ 優先使用下方靜態賽事手冊回答。
-  
-【安全規則】
-- 任何涉及「寫入」「更新」「修改」「紀錄」「填入」比分或賽程的指令，一律為 Reject_Update。
-- 語音助理嚴格唯讀，不得協助任何資料寫入。
-
-【輸出格式規定】必須是合法 JSON，包含以下欄位：
-1. "intent"：以上五種之一。
-2. "response_text"：給主辦人聽的語音回覆，100 字以內，專業簡潔。
-   - Reject_Update：「抱歉，為確保賽事公平性，語音助理目前僅開放比分查詢，若需修改請洽紀錄台工作人員。」
-   - Query_Score_Status/Query_Schedule：根據 [工具查詢結果] 撰寫自然語句。
-3. "action"：
-   - Broadcast：{"target": "all" | "<編號>", "message": "<廣播全文>"}
-   - 其餘一律 null
-4. "query_params"（僅 Query_Score_Status / Query_Schedule 需要）：
-   - Query_Score_Status：{"match_id": "<場次ID>"}
-   - Query_Schedule：{"type": "groups"|"standings"|"loser_standings"|"elimination", "group": "<組別名稱或null>"}
-
-【絕對禁止】
-- 不可在 JSON 之外輸出任何文字、解釋或 Markdown
-- 不可揭露你是 AI 或語言模型
-- action、query_params 欄位不可缺少（無值時設為 null）
+【回答規則——嚴格執行】
+1. 只能依據下方提供的【賽事手冊】與【即時查詢資料】回答，不可自行捏造資料。
+2. 如果找不到答案，請說：「這個問題我不清楚，建議直接問報到台工作人員喔！」
+3. 回覆必須 50 字以內，口語化，像在現場說話一樣，不要用表格或 Markdown 格式。
+4. 不要說你是 AI 或語言模型。
 
 """
 
-_REJECT_UPDATE_TEXT = (
-    "抱歉，為確保賽事公平性，語音助理目前僅開放比分查詢，"
-    "若需修改請洽紀錄台工作人員。"
-)
 
-
-def _build_system_prompt(include_schedule: bool = False) -> str:
-    """組裝 System Prompt。可選擇是否包含靜態賽事手冊。"""
-    static_section = (
-        f"\n【靜態賽事手冊（請優先依此回答賽制、地點、規則等問題）】\n{_SCHEDULE_STATIC}\n"
-        if (_SCHEDULE_STATIC and include_schedule) else ""
-    )
-    return _BASE_SYSTEM_PROMPT.strip() + static_section
-
-
-def build_prompt(
-    user_id: str,
-    user_input: str,
-    tool_context: str | None = None,
-    include_schedule: bool = False,
+def build_final_prompt(
+    user_text: str,
+    intent: Intent,
+    dynamic_data: str = "",
 ) -> str:
-    """組裝完整 ChatML 格式 Prompt，動態注入工具查詢結果或手冊。"""
-    history = get_history(user_id)
-    system  = _build_system_prompt(include_schedule)
-    if tool_context:
-        system = system.rstrip() + f"\n\n【本輪相關資訊（優先依此回答）】\n{tool_context}\n"
-
-    parts: list[str] = [f"<|im_start|>system\n{system}<|im_end|>\n"]
-    for turn in history.turns:
-        parts.append(f"<|im_start|>{turn.role}\n{turn.content}<|im_end|>\n")
-    parts.append(f"<|im_start|>user\n{user_input}<|im_end|>\n")
-    parts.append("<|im_start|>assistant\n")
-    return "".join(parts)
-
-
-# ─── JSON 解析 ────────────────────────────────────────────────────────────────
-
-_JSON_EXTRACT_RE  = re.compile(r"\{.*?\}", re.DOTALL)
-_MD_CODE_BLOCK_RE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
-
-_FALLBACK_RESPONSE = AgentResponse(
-    intent=Intent.GENERAL_CHAT,
-    response_text="抱歉，我剛才沒聽清楚，請再說一次。",
-    action=None,
-)
-
-
-def parse_llm_json(raw: str) -> tuple[AgentResponse, dict]:
     """
-    解析 LLM 輸出 JSON，回傳 (AgentResponse, query_params)。
-    容錯：解析失敗時回傳 fallback General_Chat。
-    """
-    if not raw.strip():
-        return _FALLBACK_RESPONSE, {}
+    組裝最終送給 LLM 的完整 Prompt（ChatML 格式）。
 
-    md_m = _MD_CODE_BLOCK_RE.search(raw)
-    json_str = md_m.group(1) if md_m else (
-        _JSON_EXTRACT_RE.search(raw).group(0)
-        if _JSON_EXTRACT_RE.search(raw) else raw
+    Parameters
+    ----------
+    user_text : str
+        使用者原始輸入。
+    intent : Intent
+        Regex 路由決定的意圖（影響 System Prompt 的說明文字）。
+    dynamic_data : str
+        即時查詢資料（Query_Score_Status 時為 Google Sheets 結果；其餘為空）。
+
+    Returns
+    -------
+    str
+        完整的 ChatML prompt 字串。
+    """
+    # 組裝 System Prompt
+    system = _BASE_SYSTEM_PROMPT
+
+    # 永遠注入靜態賽事手冊
+    if _SCHEDULE_STATIC:
+        system += f"【賽事手冊（規則、場地、賽制、報名等靜態資訊）】\n{_SCHEDULE_STATIC}\n\n"
+
+    # 若有即時查詢資料，額外注入
+    if dynamic_data:
+        system += f"【即時查詢資料（優先依此回答比分相關問題）】\n{dynamic_data}\n\n"
+
+    # 根據 intent 給 LLM 額外提示
+    if intent == Intent.BROADCAST:
+        system += "【任務】使用者想廣播，請協助將廣播內容整理為清楚的廣播文稿（繁體中文，口語化）。\n"
+    elif intent == Intent.QUERY_SCORE_STATUS:
+        system += "【任務】使用者詢問比分或賽況，請依據即時查詢資料回答。若查無資料請誠實告知。\n"
+    elif intent == Intent.QUERY_SCHEDULE:
+        system += "【任務】使用者詢問賽事規則或靜態資訊，請依據賽事手冊回答。\n"
+    else:  # General_Chat
+        system += "【任務】使用者有一般詢問，請依據賽事手冊回答；若手冊無資料則說不清楚。\n"
+
+    return (
+        f"<|im_start|>system\n{system.strip()}<|im_end|>\n"
+        f"<|im_start|>user\n{user_text}<|im_end|>\n"
+        f"<|im_start|>assistant\n"
     )
 
-    try:
-        data = json.loads(json_str)
-        intent_val = str(data.get("intent", "General_Chat")).strip()
-        matched_intent = None
-        for member in Intent:
-            if member.value.lower() == intent_val.lower():
-                matched_intent = member
-                break
-        intent = matched_intent if matched_intent else Intent.GENERAL_CHAT
 
-        query_params = data.get("query_params") or {}
-        response_text = (data.get("response_text") or "").strip()
-        
-        # 防止空字串導致 LINE API 回傳 400 錯誤
-        if not response_text:
-            response_text = "好的，馬上為您查詢。" if intent != Intent.GENERAL_CHAT else _FALLBACK_RESPONSE.response_text
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🔧 工具呼叫
+# ═══════════════════════════════════════════════════════════════════════════════
 
-        return AgentResponse(
-            intent=intent,
-            response_text=response_text,
-            action=data.get("action"),
-        ), query_params
-
-    except (json.JSONDecodeError, KeyError, ValueError) as exc:
-        logger.warning(f"⚠️  JSON 解析失敗（{exc}）｜raw={raw!r:.120}")
-        return _FALLBACK_RESPONSE, {}
-
-
-# ─── 動態工具路由 ─────────────────────────────────────────────────────────────
-
-def _run_schedule_tool(query_params: dict) -> str:
+def _fetch_score_context(user_text: str) -> str:
     """
-    根據 LLM 輸出的 query_params 呼叫對應的賽程查詢工具。
+    呼叫 Google Sheets 工具，以使用者原文作為 match_id hint。
 
-    query_params 格式：
-      {"type": "schedule"|"groups"|"standings"|"elimination",
-       "day":   "<第1天/第2天>" | null,
-       "group": "<A組/B組/…>"  | null}
+    注意：tool_query_google_sheet 內部會做模糊比對，
+    傳入完整使用者文字即可，讓工具自行篩選有效欄位。
     """
-    qtype = (query_params.get("type") or "schedule").lower()
-    day   = query_params.get("day")   or None
-    group = query_params.get("group") or None
-
-    if qtype == "groups":
-        return tool_query_groups(group)
-    elif qtype == "standings":
-        return tool_query_standings(group)
-    elif qtype == "elimination":
-        return tool_query_elimination(group)
-    else:  # default: schedule
-        return tool_query_schedule(day)
+    result: MatchQueryResult = tool_query_google_sheet(user_text)
+    context = format_match_result_for_llm(result)
+    logger.info(f"🔍 Google Sheets 查詢結果｜{context[:100]}")
+    return context
 
 
-# ─── Agent 主流程 ─────────────────────────────────────────────────────────────
+# ═══════════════════════════════════════════════════════════════════════════════
+# 🤖 Agent 主流程（單輪 LLM）
+# ═══════════════════════════════════════════════════════════════════════════════
 
 async def chat(user_id: str, user_input: str) -> AgentResponse:
     """
-    完整 Agent 推論流程（兩輪 LLM）：
+    完整 Agent 推論流程（單輪 LLM）：
 
-    第一輪 → intent 分類 + query_params 萃取
-        ├─ Reject_Update → 硬短路
-        ├─ Query_Score_Status → tool_query_google_sheet(match_id)
-        │                     → 第二輪 LLM（注入比分結果）
-        ├─ Query_Schedule     → _run_schedule_tool(query_params)
-        │                     → 第二輪 LLM（注入查詢結果）
-        └─ Broadcast / General_Chat → 直接輸出（General_Chat 已有 schedule.md）
+    1. fast_intent_router      → Regex 意圖分類（毫秒級）
+    2. Reject_Update           → 硬短路，不呼叫 LLM
+    3. Query_Score_Status      → 呼叫 Google Sheets 工具取得 dynamic_data
+    4. build_final_prompt      → 組裝完整 Prompt（含 schedule.md + dynamic_data）
+    5. generate()              → 單次 LLM 推論
+    6. 回傳 AgentResponse（純文字）
     """
-    logger.debug(f"💬 Agent｜{user_id}｜歷史輪數={len(get_history(user_id).turns)}")
+    logger.info(f"💬 Agent.chat｜user={user_id}｜input={user_input!r:.80}")
 
-    # ── 第一輪 LLM：intent 分類 ──────────────────────────────────────────────
-    logger.debug("開始組裝分類 Prompt...")
-    prompt_classify     = build_prompt(user_id, user_input, include_schedule=False)
-    logger.debug(f"分類 Prompt 組裝完成 (長度: {len(prompt_classify)})，準備呼叫 LLM...")
-    try:
-        raw_classify    = await generate(prompt_classify)
-        logger.debug(f"LLM 呼叫完成，取得字串長度: {len(raw_classify)}，準備解析 JSON...")
-    except Exception as e:
-        logger.error(f"❌ 呼叫 LLM 時發生錯誤：{e}")
-        raise
-    agent_resp, qparams = parse_llm_json(raw_classify)
+    # ── Step 1: Regex 路由 ──────────────────────────────────────────────────
+    route = fast_intent_router(user_input)
+    intent: Intent = route["intent"]
 
-    logger.info(
-        f"🎯 intent={agent_resp.intent.value}｜"
-        f"qparams={qparams}｜action={agent_resp.action}｜"
-        f"{agent_resp.response_text[:60]}"
-    )
-
-    # ── Reject_Update 防護（硬短路）────────────────────────────────────────
-    if agent_resp.intent == Intent.REJECT_UPDATE:
+    # ── Step 2: Reject_Update 硬短路 ───────────────────────────────────────
+    if intent == Intent.REJECT_UPDATE:
         logger.warning(f"🚫 Reject_Update 攔截｜{user_id}｜{user_input!r:.80}")
         return AgentResponse(
             intent=Intent.REJECT_UPDATE,
@@ -333,52 +254,36 @@ async def chat(user_id: str, user_input: str) -> AgentResponse:
             action=None,
         )
 
-    # ── 工具呼叫 ──────────────────────────────────────────────────────────
-    tool_context: str | None = None
+    # ── Step 3: 工具呼叫（視 intent 決定）──────────────────────────────────
+    dynamic_data = ""
+    if intent == Intent.QUERY_SCORE_STATUS:
+        dynamic_data = _fetch_score_context(user_input)
 
-    if agent_resp.intent == Intent.QUERY_SCORE_STATUS:
-        match_id = qparams.get("match_id") or user_input
-        result: MatchQueryResult = tool_query_google_sheet(match_id)
-        tool_context = format_match_result_for_llm(result)
-        logger.info(f"🔍 比分查詢｜match_id={match_id}｜{tool_context[:80]}")
+    # ── Step 4: 組裝 Prompt ──────────────────────────────────────────────
+    prompt = build_final_prompt(user_input, intent, dynamic_data)
+    logger.debug(f"📝 Prompt 長度：{len(prompt)} chars")
 
-    elif agent_resp.intent == Intent.QUERY_SCHEDULE:
-        tool_context = _run_schedule_tool(qparams)
-        logger.info(f"📅 賽程查詢｜type={qparams.get('type')}｜{tool_context[:80]}")
-        
-    elif agent_resp.intent == Intent.GENERAL_CHAT:
-        # General_Chat 需要 schedule.md 作為知識庫進行第二輪對話回答
-        logger.info("閒聊/問答意圖，準備第二輪 LLM 檢索賽事手冊")
-        tool_context = _SCHEDULE_STATIC
+    # ── Step 5: 單次 LLM 推論 ────────────────────────────────────────────
+    try:
+        raw = await generate(prompt)
+        response_text = raw.strip()
+        # 防止空字串導致 LINE API 400
+        if not response_text:
+            response_text = "抱歉，我剛才沒理解，可以再說一次嗎？"
+    except Exception as exc:
+        logger.error(f"❌ LLM 推論失敗：{exc}")
+        raise RuntimeError("LLM 推論失敗") from exc
 
-    # ── 第二輪 LLM（需要參考資料時觸發）──────────────────────────────────
-    if tool_context or agent_resp.intent == Intent.GENERAL_CHAT:
-        prompt_final       = build_prompt(
-            user_id, 
-            user_input, 
-            tool_context=tool_context if agent_resp.intent != Intent.GENERAL_CHAT else None,
-            include_schedule=True
-        )
-        logger.debug(f"準備進行第二輪 LLM 回答... Prompt 長度: {len(prompt_final)}")
-        raw_final          = await generate(prompt_final)
-        final_agent_resp, _ = parse_llm_json(raw_final)
-        
-        # 保留第一輪解析出的 Intent 和 query_params，只替換最終回答
-        agent_resp.response_text = final_agent_resp.response_text
-        if final_agent_resp.action:
-            agent_resp.action = final_agent_resp.action
-            
-        logger.info(f"🗣️  最終回覆｜{agent_resp.response_text[:80]}")
+    logger.info(f"✅ Agent 回覆｜intent={intent.value}｜{response_text[:80]}")
 
-    # ── 更新對話歷史 ────────────────────────────────────────────────────────
-    history = get_history(user_id)
-    history.add_user(user_input)
-    history.add_assistant(agent_resp.response_text)
-
-    return agent_resp
+    return AgentResponse(
+        intent=intent,
+        response_text=response_text,
+        action=None,  # Broadcast 的 action 目前由 line_handler 處理廣播文字即可
+    )
 
 
-# ─── 指令解析 ─────────────────────────────────────────────────────────────────
+# ─── 指令解析（維持原有 reset 功能）──────────────────────────────────────────
 
 _RESET_KEYWORDS = {"重設", "重置", "清除記憶", "忘掉之前", "forget", "reset"}
 

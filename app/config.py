@@ -52,7 +52,10 @@ class Settings(BaseSettings):
     llm_max_tokens: int = 512
     llm_temperature: float = 0.7
 
-    # ── Whisper STT ───────────────────────────────────────────────────────────
+    # ── Groq API（STT: whisper-large-v3）────────────────────────────────────
+    groq_api_key: str | None = Field(default=None, description="Groq API Key（STT 使用）")
+
+    # ── Whisper STT 本地設定（已棄用，保留供相容）─────────────────────────
     whisper_model_size: Literal["tiny", "base", "small", "medium", "large-v3"] = "base"
     whisper_device: Literal["cpu", "cuda"] = "cpu"
     whisper_compute_type: Literal["int8", "float16", "float32"] = "int8"

@@ -1,4 +1,10 @@
-# Project Ē-Kóng (會講) — 開發 Walkthrough
+# Project Ē-Kóng (會講) v2 — 開發 Walkthrough
+
+> **架構版本**：v2（語音輸入 × 文字輸出）
+> **重構日期**：2026-04-10
+> **主要變更**：本地 Whisper STT → Groq API；移除 TTS；引入光速 Regex 路由
+
+---
 
 ## 完整目錄結構
 
@@ -6,29 +12,29 @@
 E-Kong/
 ├── app/
 │   ├── models/
-│   │   ├── stt.py          # Faster-Whisper STT（單例 + asyncio.Lock）
-│   │   ├── llm.py          # GGUF LLM（llama.cpp，ThreadPoolExecutor）
-│   │   ├── tts_zh.py       # ChatTTS 中文 TTS
-│   │   └── tts_tw.py       # MMS-TTS 台語（facebook/mms-tts-nan）
+│   │   └── llm.py          # GGUF LLM 單例（llama.cpp，ThreadPoolExecutor）
 │   ├── services/
-│   │   ├── audio.py        # LINE 音訊下載 / ffmpeg 轉換 / TTS 上傳
-│   │   ├── agent.py        # 情緒偵測 + ChatML Prompt + 對話歷史
-│   │   └── tts.py          # TTS 路由 dispatcher
+│   │   ├── audio.py        # LINE 音訊下載 / ffmpeg 轉換（m4a → WAV）
+│   │   ├── agent.py        # Regex 路由 + build_final_prompt + 單輪 LLM
+│   │   └── tools.py        # Google Sheets CSV 查詢工具群
+│   ├── data/
+│   │   └── schedule.md     # 靜態賽事手冊（規則/場地/賽制）
 │   ├── config.py           # pydantic-settings 集中管理
-│   ├── line_handler.py     # LINE 事件路由 + 簽名驗證
+│   ├── line_handler.py     # LINE 事件路由 + Groq STT + 簽名驗證
 │   └── main.py             # FastAPI lifespan + /webhook + /health
-├── scripts/
-│   └── vram_profile.py     # VRAM 量測 + 調優建議
 ├── tests/
-│   └── test_pipeline.py    # 30+ pytest 測試（全 Mock，不需 GPU）
-├── setup_colab.py          # Colab 自動化啟動腳本
-├── setup_ekong.ipynb       # Colab 一鍵啟動 notebook
+│   └── test_pipeline.py    # pytest 測試（Mock 版，不需 GPU）
+├── setup_colab.py          # Colab 自動化啟動腳本（v2）
+├── setup_ekong.ipynb       # Colab 一鍵啟動 Notebook
 ├── requirements.txt
 ├── pytest.ini
-└── .env.example
+├── .env.example
+└── walkthrough.md
 ```
 
-## 完整訊息流程
+---
+
+## 訊息流程（v2）
 
 ```
 LINE 使用者
@@ -37,76 +43,182 @@ LINE 使用者
 LINE Messaging API
   │
   ▼ Webhook POST /webhook
-FastAPI (ngrok → Colab)
+FastAPI (ngrok → Colab) — 立即回 200 OK
   │
-  ├─[文字訊息]──▶ parse_command() → chat() → detect_emotion()
-  │                                 → build_prompt() → LLM.generate()
-  │                                 → try_reply_audio() → ChatTTS / MMS-TTS
+  ├─[文字訊息]─▶ fast_intent_router() [Regex，毫秒級]
+  │               │
+  │               ├─ Reject_Update ──▶ 直接拒絕文字（不過 LLM）
+  │               ├─ Broadcast     ──▶ build_final_prompt() → LLM → push_text
+  │               ├─ Query_Score   ──▶ tool_query_google_sheet() → LLM → push_text
+  │               ├─ Query_Schedule──▶ schedule.md → LLM → push_text
+  │               └─ General_Chat  ──▶ schedule.md → LLM → push_text
   │
-  └─[語音訊息]──▶ download_line_audio() → ffmpeg WAV
-                  → Whisper.transcribe() → STT 文字
-                  → chat() → LLM.generate()
-                  → try_reply_audio() (語言路由: "nan"→MMS / 否則→ChatTTS)
-                  → reply_audio_message() → LINE Audio Message
+  └─[語音訊息]─▶ download_line_audio() → ffmpeg WAV
+                  │
+                  ▼ asyncio.to_thread（不阻塞 event loop）
+                 Groq API whisper-large-v3 (STT)
+                  │
+                  ▼ 文字結果
+                 fast_intent_router() → 同上文字流程
 ```
 
-## 使用教學（快速開始）
+---
 
-### 1. 前置作業（取得 Tokens）
-- **LINE Messaging API**：
-  1. 至 [LINE Developers Console](https://developers.line.biz/) 建立 Provider 與 Channel (Messaging API)。
-  2. 取得 **Channel Access Token**（需核發）與 **Channel Secret**（在 Basic settings）。
-  3. 關閉「自動回覆訊息」與「問候訊息」功能（在官方帳號設定中）。
-- **ngrok**：
-  1. 註冊 [ngrok](https://ngrok.com/)。
-  2. 至 Dashboard 取得 **Auth Token**。
+## 快速開始
 
-### 2. 準備 GGUF 模型
-1. 至 HuggingFace 下載 `taide-lx-7b-chat.Q4_K_M.gguf`（或 Llama 3 8B Instruct GGUF）。
-2. 將模型上傳至你的 Google Drive 任意資料夾，例如：`我的雲端硬碟/ekong_models/`。
+### 1. 取得所需 Token / Key
 
-### 3. Colab 部署與啟動
-1. 在瀏覽器開啟 Google Colab。
-2. 匯入或上傳本專案的 [setup_ekong.ipynb](file:///d:/E-Kong/setup_ekong.ipynb)。
-3. **設定 Colab Secrets**（左側側邊欄的鑰匙圖示 🔑）：
-   - 新增 `LINE_CHANNEL_ACCESS_TOKEN` 並貼上你的 Token。
-   - 新增 `LINE_CHANNEL_SECRET`。
-   - 新增 `NGROK_AUTH_TOKEN`。
-4. 設定 Runtime（執行階段）：選擇 **T4 GPU**。
-5. **依序執行 Notebook 的 Cell 1 到 4**：
-   - Cell 1：確認 GPU 狀態。
-   - Cell 2：向 GitHub Clone 本專案。
-   - Cell 3：自動生成 `.env` 設定檔（預設 LLM 路徑為 `/content/drive/MyDrive/ekong_models/taide-lx-7b-chat.Q4_K_M.gguf`，請依實際擺放位置修改 Cell 3 的路徑）。
-   - Cell 4：執行環境建置（掛載 Google Drive、安裝依賴、啟動 FastAPI 與 ngrok 並自動註冊 LINE Webhook）。首次執行約需 5–8 分鐘。
+| 服務 | 取得方式 |
+|------|---------|
+| LINE Channel Access Token | [LINE Developers Console](https://developers.line.biz/) → Messaging API Channel |
+| LINE Channel Secret | 同上 → Basic settings |
+| ngrok Auth Token | [ngrok Dashboard](https://dashboard.ngrok.com/get-started/your-authtoken) |
+| **Groq API Key** | [console.groq.com](https://console.groq.com/) → 免費方案：2000 分鐘/天 |
 
-### 4. 測試與使用
-1. Notebook 啟動完成後會印出 🎉 服務已啟動，並顯示 Webhook URL。
-2. 開啟你的 LINE，加入剛建立的機器人好友。
-3. 傳送文字訊息或語音訊息，機器人就會用語音（中文 ChatTTS 或台語 MMS-TTS）並搭配文字回覆！
+> **重要**：關閉 LINE 官方帳號的「自動回覆」與「問候訊息」功能。
 
-> **ℹ️ 開發者重啟技巧**：若中斷連線，只需重新執行 Notebook 的 **Cell 5 (快速重啟)** 即可，無須重新安裝套件。
+### 2. 準備 LLM 模型（GGUF）
+
+1. 從 HuggingFace 下載量化模型，例如：
+   - `Qwen2.5-1.5B-Instruct-Q4_K_M.gguf`（輕量，CPU 即可）
+   - `Qwen2.5-7B-Instruct-Q4_K_M.gguf`（效果更佳，T4 GPU 推薦）
+2. 上傳至 Google Drive：`我的雲端硬碟/ekong_models/`
+
+### 3. Colab 部署
+
+1. 開啟 [Google Colab](https://colab.google/)，Runtime 選 **T4 GPU**。
+2. Clone 本專案：
+   ```bash
+   !git clone https://github.com/YOUR_USERNAME/E-Kong.git
+   %cd E-Kong
+   ```
+3. 設定 **Colab Secrets**（左側 🔑 圖示）：
+   ```
+   LINE_CHANNEL_ACCESS_TOKEN  = <你的 Token>
+   LINE_CHANNEL_SECRET        = <你的 Secret>
+   NGROK_AUTH_TOKEN           = <你的 ngrok Token>
+   GROQ_API_KEY               = <你的 Groq Key>   ← v2 新增，必填
+   ```
+4. 建立 `.env`：
+   ```python
+   import os, json
+   from google.colab import userdata
+
+   env = {
+       "LINE_CHANNEL_ACCESS_TOKEN": userdata.get("LINE_CHANNEL_ACCESS_TOKEN"),
+       "LINE_CHANNEL_SECRET":       userdata.get("LINE_CHANNEL_SECRET"),
+       "NGROK_AUTH_TOKEN":          userdata.get("NGROK_AUTH_TOKEN"),
+       "GROQ_API_KEY":              userdata.get("GROQ_API_KEY"),
+       "LLM_MODEL_PATH":            "/content/drive/MyDrive/ekong_models/qwen2.5-1.5b-instruct-q4_k_m.gguf",
+       "LLM_N_GPU_LAYERS":          "35",
+       "LLM_MAX_TOKENS":            "512",
+       "LLM_TEMPERATURE":           "0.7",
+       # Google Sheets CSV 網址（依實際填入）
+       "GOOGLE_SHEET_CSV_SCORE":    "",
+       "GOOGLE_SHEET_CSV_GROUPS":   "",
+       "GOOGLE_SHEET_CSV_STANDINGS":"",
+       "GOOGLE_SHEET_CSV_LOSER_STANDINGS": "",
+       "GOOGLE_SHEET_CSV_ELIMINATION":     "",
+   }
+   with open(".env", "w") as f:
+       for k, v in env.items():
+           f.write(f"{k}={v}\n")
+   print(".env 建立完成")
+   ```
+5. 啟動系統：
+   ```bash
+   !python setup_colab.py
+   ```
+
+### 4. 測試指令範例
+
+| 輸入類型 | 範例 | 預期行為 |
+|---------|------|---------|
+| 文字 | `「A組第一場現在比分幾比幾？」` | 查詢 Google Sheets → 文字推播比分 |
+| 文字 | `「報名截止時間是幾點？」` | 讀 schedule.md → 文字回答 |
+| 文字 | `「廣播：請108號選手到報到台」` | LLM 整理廣播稿 → 文字回覆 |
+| 文字 | `「幫我把第一場改成台大勝」` | Regex 直接攔截 → 拒絕，不過 LLM |
+| 語音 | 說「A組第一場比分多少」 | Groq STT → 同上文字流程 |
+| 文字 | `reset` | 清除對話記憶 |
+
+---
 
 ## 環境變數（.env）
 
-| 變數 | 說明 |
-|------|------|
-| `LINE_CHANNEL_ACCESS_TOKEN` | LINE Channel Access Token |
-| `LINE_CHANNEL_SECRET` | LINE Channel Secret |
-| `NGROK_AUTH_TOKEN` | ngrok 認證 Token |
-| `LLM_MODEL_PATH` | GGUF 模型路徑（Google Drive） |
-| `LLM_N_GPU_LAYERS` | GPU offload 層數（T4 建議 35） |
-| `WHISPER_MODEL_SIZE` | `tiny` / `base` / `small` |
+| 變數 | 必填 | 說明 |
+|------|:----:|------|
+| `LINE_CHANNEL_ACCESS_TOKEN` | ✅ | LINE Channel Access Token |
+| `LINE_CHANNEL_SECRET` | ✅ | LINE Channel Secret |
+| `NGROK_AUTH_TOKEN` | ✅ | ngrok 認證 Token |
+| `GROQ_API_KEY` | ✅ | Groq API Key（STT 使用） |
+| `LLM_MODEL_PATH` | ✅ | GGUF 模型路徑 |
+| `LLM_N_GPU_LAYERS` | | GPU offload 層數（T4 建議 35，CPU 改 0） |
+| `GOOGLE_SHEET_CSV_SCORE` | | 賽程比分 CSV 公開網址 |
+| `GOOGLE_SHEET_CSV_GROUPS` | | 分組名單 CSV 公開網址 |
+| `GOOGLE_SHEET_CSV_STANDINGS` | | 積分表 CSV 公開網址 |
+| `GOOGLE_SHEET_CSV_LOSER_STANDINGS` | | 敗者組積分 CSV 公開網址 |
+| `GOOGLE_SHEET_CSV_ELIMINATION` | | 晉淘結果 CSV 公開網址 |
 
-## VRAM 預算（T4 15GB）
+---
 
-| 模組 | 佔用 |
-|------|------|
-| Whisper base INT8 | ~300 MB |
-| TAIDE-7B Q4_K_M (35 層) | ~4.8 GB |
-| ChatTTS | ~1.5 GB |
-| MMS-TTS | ~300 MB |
-| 系統 overhead | ~1 GB |
-| **合計** | **~8 GB ✅** |
+## VRAM 預算（v2 vs v1）
+
+| 模組 | v1 佔用 | v2 佔用 |
+|------|:-------:|:-------:|
+| Whisper STT | ~300 MB | **0 MB**（Groq API）|
+| Qwen 1.5B Q4 (35 層) | – | ~2.5 GB |
+| ChatTTS | ~1.5 GB | **0 MB**（已移除）|
+| MMS-TTS 台語 | ~300 MB | **0 MB**（已移除）|
+| LLM（TAIDE 7B Q4）| ~4.8 GB | 可選 |
+| **合計（1.5B 版）** | **~8 GB** | **~2.5 GB ✅** |
+
+> v2 顯著降低 VRAM 需求，**CPU-only Colab 也能跑**（使用 CPU 版 llama-cpp + Groq API）
+
+---
+
+## 意圖路由邏輯（Regex 優先權）
+
+```
+輸入文字
+  │
+  ├─ 1. Reject_Update  ← (改|修改|更新|刪除|填入|記錄).*(比分|賽程)
+  ├─ 2. Broadcast      ← 廣播
+  ├─ 3. Query_Score    ← (比分|幾比幾|誰贏|賽程|比賽|結果|狀態…)
+  ├─ 4. Query_Schedule ← (規則|網高|資格|報名|停車|場地|積分怎麼算…)
+  └─ 5. General_Chat   ← 無命中（fallback）
+```
+
+**Reject_Update 優先权最高**：確保「修改比分廣播給大家」不會誤觸 Broadcast。
+
+---
+
+## 健康檢查 API
+
+```
+GET /health
+```
+
+回傳範例（v2）：
+```json
+{
+  "status": "ok",
+  "service": "Ē-Kóng",
+  "version": "2.0.0",
+  "models": {
+    "llm": "ok",
+    "stt_groq": "key_set",
+    "tts": "disabled (text-only mode)"
+  },
+  "gpu": {
+    "device": "Tesla T4",
+    "allocated_mb": "2560",
+    "total_mb": "15360",
+    "usage_pct": "16.7%"
+  }
+}
+```
+
+---
 
 ## 測試執行
 
@@ -115,45 +227,31 @@ FastAPI (ngrok → Colab)
 pip install pytest pytest-asyncio
 pytest tests/ -v
 
-# Colab VRAM 量測
-python scripts/vram_profile.py
-python scripts/vram_profile.py --only stt llm  # 只測指定模組
+# 快速驗證 Regex 路由（不需任何服務）
+python -c "
+from app.services.agent import fast_intent_router
+tests = [
+    '幫我把第一場改成台大勝',     # → Reject_Update
+    '廣播：請108號到報到台',       # → Broadcast
+    'A組第一場現在比分多少',       # → Query_Score_Status
+    '報名截止時間是幾點',          # → Query_Schedule
+    '廁所在哪裡',                  # → General_Chat
+]
+for t in tests:
+    r = fast_intent_router(t)
+    print(f'{r[\"intent\"].value:25} ← {t}')
+"
 ```
 
-## 健康檢查 API
-
-`GET /health` 回傳：
-```json
-{
-  "status": "ok",
-  "service": "Ē-Kóng",
-  "version": "0.1.0",
-  "models": {
-    "stt": "ok",
-    "llm": "ok",
-    "tts_zh": "ok",
-    "tts_tw": "ok"
-  },
-  "gpu": {
-    "device": "Tesla T4",
-    "allocated_mb": "8192",
-    "total_mb": "15360",
-    "usage_pct": "53.3%"
-  }
-}
-```
-
-## 指令支援
-
-| 使用者輸入 | 行為 |
-|-----------|------|
-| 任意文字 | 情緒偵測 → LLM → TTS 回覆 |
-| 語音訊息 | STT → LLM → TTS 回覆（台語語音自動切 MMS-TTS）|
-| `重設` / [reset](file:///d:/E-Kong/tests/test_pipeline.py#147-153) | 清除此使用者對話歷史 |
+---
 
 ## Graceful Fallback 機制
 
-- LLM 未載入 → Echo 模式（原文回傳）
-- TTS 合成失敗 → 純文字回覆
-- STT 未辨識到文字 → 提示重說
-- 音訊下載失敗 → 友善錯誤訊息
+| 情境 | 處理方式 |
+|------|---------|
+| LLM 未載入 | Echo 模式（原文推播） |
+| Groq STT 失敗 | 錯誤訊息推播 + 建議改文字輸入 |
+| 語音辨識為空（靜音） | 提示「訊號不清楚，請再說一次」 |
+| Reject_Update | 硬短路，不過 LLM，直接推播拒絕訊息 |
+| Google Sheets 查詢失敗 | LLM 誠實告知無資料（schedule.md 仍可用） |
+| 音訊下載失敗 | 友善錯誤訊息 |
